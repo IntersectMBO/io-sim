@@ -47,9 +47,9 @@ specification.
 * [Marcin Szamotulski (@coot) IOSim and Partial Order Reduction][io-sim-por-presentation]
 
 [`io-sim`]:  https://hackage.haskell.org/package/io-sim
-[`io-classes`]: https://input-output-hk.github.io/io-sim/io-classes/index.html
-[`si-timers`]: https://input-output-hk.github.io/io-sim/io-classes/si-timers/index.html
-[`IOSimPOR`]: https://github.com/input-output-hk/io-sim/tree/main/io-sim/how-to-use-IOSimPOR.md
+[`io-classes`]: https://intersectmbo/io-sim/io-classes/index.html
+[`si-timers`]: https://intersectmbo/io-sim/io-classes/si-timers/index.html
+[`IOSimPOR`]: https://github.com/intersectmbo/io-sim/tree/main/io-sim/how-to-use-IOSimPOR.md
 [`IOSim`]: https://hackage.haskell.org/package/io-sim/docs/Control-Monad-IOSim.html#t:IOSim
 
 [bob-conf]: https://youtu.be/uedUGeWN4ZM

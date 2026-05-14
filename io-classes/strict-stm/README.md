@@ -11,7 +11,7 @@ which might lurk in `stm` shared mutable variables.  Together with the
 [`nothunks`] library it was successfully used to eliminate and keep a large
 system ([`cardano-node`]) space leak free.
 
-[`cardano-node`]: https://www.github.com/input-output-hk/cardano-node
+[`cardano-node`]: https://www.github.com/intersectmbo/cardano-node
 [`io-classes:io-classes`]: https://hackage.haskell.org/package/io-classes
 [`io-sim`]: https://hackage.haskell.org/package/io-sim
 [`nothunks`]: https://hackage.haskell.org/package/nothunks

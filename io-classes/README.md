@@ -12,19 +12,19 @@ constraints in mind:
 
 We provide also non-standard extensions of this API in **sublibraries**:
 
-* [`io-classes:strict-stm`](https://input-output-hk.github.io/io-sim/io-classes/strict-stm/index.html) strict `TVar`'s, and other mutable `STM` variables, with
+* [`io-classes:strict-stm`](https://intersectmbo.github.io/io-sim/io-classes/strict-stm/index.html) strict `TVar`'s, and other mutable `STM` variables, with
   support of the [`nothunks`] library;
-* [`io-classes:strict-mvar`](https://input-output-hk.github.io/io-sim/io-classes/strict-mvar/index.html): strict `MVar`s
-* [`io-classes:si-timers`](https://input-output-hk.github.io/io-sim/io-classes/si-timers/index.html): timers api:
+* [`io-classes:strict-mvar`](https://intersectmbo.github.io/io-sim/io-classes/strict-mvar/index.html): strict `MVar`s
+* [`io-classes:si-timers`](https://intersectmbo.github.io/io-sim/io-classes/si-timers/index.html): timers api:
 
     - 32-bit safe API using `DiffTime` measured in seconds (rather than time in
       microseconds represented as `Int` as in `base`)
     - cancellable timeouts.
 
-* [`io-classes:mtl`](https://input-output-hk.github.io/io-sim/io-classes/mtl/index.html):
+* [`io-classes:mtl`](https://intersectmbo.github.io/io-sim/io-classes/mtl/index.html):
   MTL instances.
 
-[`io-classes:strict-stm`](https://input-output-hk.github.io/io-sim/io-classes/strict-stm/index.html)
+[`io-classes:strict-stm`](https://intersectmbo.github.io/io-sim/io-classes/strict-stm/index.html)
 and [`nothunks`] were successfully used in a large
 code base to eliminate space leaks and keep that property over long development
 cycles.
@@ -80,7 +80,7 @@ delays & timers.
 ## Software Transactional Memory API
 
 We provide two interfaces to `stm` API: lazy, included in [`io-classes`][lazy-stm]; and
-strict one provided by [`io-classes:strict-stm`](https://input-output-hk.github.io/io-sim/io-classes/strict-stm/index.html).
+strict one provided by [`io-classes:strict-stm`](https://intersectmbo.github.io/io-sim/io-classes/strict-stm/index.html).
 
 ## Threads API
 
@@ -164,27 +164,27 @@ only possible because we can control the execution environment of [`io-sim`].
 [`base`]: https://hackage.haskell.org/package/base
 [`exceptions`]: https://hackage.haskell.org/package/exceptions
 [`io-sim`]: https://hackage.haskell.org/package/io-sim
-[io-classes:strict-mvar]: https://input-output-hk.github.io/io-sim/io-classes/strict-mvar/index.html
-[io-classes:mtl]: https://input-output-hk.github.io/io-sim/io-classes/mtl/index.html
+[io-classes:strict-mvar]: https://intersectmbo.github.io/io-sim/io-classes/strict-mvar/index.html
+[io-classes:mtl]: https://intersectmbo.github.io/io-sim/io-classes/mtl/index.html
 [`stm`]: https://hackage.haskell.org/package/stm
-[lazy-stm]: https://input-output-hk.github.io/io-sim/io-classes/Control-Concurrent-Class-MonadSTM.html
+[lazy-stm]: https://intersectmbo.github.io/io-sim/io-classes/Control-Concurrent-Class-MonadSTM.html
 [`threadDelay`]: https://hackage.haskell.org/package/io-classes/docs/Control-Monad-Class-MonadTimer.html#v:threadDelay
 [`time`]: https://hackage.haskell.org/package/time
-[contributing]: https://www.github.com/input-output-hk/io-sim/tree/master/CONTRIBUTING.md
+[contributing]: https://www.github.com/intersectmbo/io-sim/tree/master/CONTRIBUTING.md
 [`nothunks`]: https://hackage.haskell.org/package/nothunks
 [labelThread-base]: https://hackage.haskell.org/package/base-4.17.0.0/docs/GHC-Conc-Sync.html#v:labelThread
 [io-deadlock]: https://hackage.haskell.org/package/base-4.19.0.0/docs/Control-Exception.html#t:Deadlock
 
-[MonadEventlog]: https://input-output-hk.github.io/io-sim/io-classes/Control-Monad-Class-MonadEventlog.html#t:MonadEventlog
+[MonadEventlog]: https://intersectmbo.github.io/io-sim/io-classes/Control-Monad-Class-MonadEventlog.html#t:MonadEventlog
 [Debug.Trace]: https://hackage.haskell.org/package/base/docs/Debug-Trace.html
-[MonadAsync]: https://input-output-hk.github.io/io-sim/io-classes/Control-Monad-Class-MonadAsync.html#t:MonadAsync
-[MonadFork]: https://input-output-hk.github.io/io-sim/io-classes/Control-Monad-Class-MonadFork.html#t:MonadFork
-[MonadMVar]: https://input-output-hk.github.io/io-sim/io-classes/Control-Concurrent-Class-MonadMVar.html#t:MonadMVar
-[`registerDelayCancellable`]: http://input-output-hk.github.io/io-sim/io-classes/si-timers/Control-Monad-Class-MonadTimer-SI.html#v:registerDelayCancellable
-[strict-mvar]: https://input-output-hk.github.io/io-sim/io-classes/strict-mvar/Control-Concurrent-Class-MonadMVar-Strict.html
-[MonadST]: https://input-output-hk.github.io/io-sim/io-classes/Control-Monad-Class-MonadST.html#t:MonadST
-[MonadSay]: https://input-output-hk.github.io/io-sim/io-classes/Control-Monad-Class-MonadSay.html#t:MonadSay
-[io-classes-haddocks]: https://input-output-hk.github.io/io-sim
+[MonadAsync]: https://intersectmbo.github.io/io-sim/io-classes/Control-Monad-Class-MonadAsync.html#t:MonadAsync
+[MonadFork]: https://intersectmbo.github.io/io-sim/io-classes/Control-Monad-Class-MonadFork.html#t:MonadFork
+[MonadMVar]: https://intersectmbo.github.io/io-sim/io-classes/Control-Concurrent-Class-MonadMVar.html#t:MonadMVar
+[`registerDelayCancellable`]: http://intersectmbo.github.io/io-sim/io-classes/si-timers/Control-Monad-Class-MonadTimer-SI.html#v:registerDelayCancellable
+[strict-mvar]: https://intersectmbo.github.io/io-sim/io-classes/strict-mvar/Control-Concurrent-Class-MonadMVar-Strict.html
+[MonadST]: https://intersectmbo.github.io/io-sim/io-classes/Control-Monad-Class-MonadST.html#t:MonadST
+[MonadSay]: https://intersectmbo.github.io/io-sim/io-classes/Control-Monad-Class-MonadSay.html#t:MonadSay
+[io-classes-haddocks]: https://intersectmbo.github.io/io-sim
 
 [bob-conf]: https://youtu.be/uedUGeWN4ZM
 [zuriHac-2022]: https://youtu.be/tKIYQgJnGkA

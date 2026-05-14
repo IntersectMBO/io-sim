@@ -8,7 +8,7 @@ update` after cloning the repository.
 We designed `io-classes` to be as close as possible to what `base` package
 provides.  Almost all `IO` instances instantiate with API provided by one of
 the core packages, see
-[example](https://github.com/input-output-hk/io-sim/blob/main/io-classes/src/Control/Monad/Class/MonadSTM.hs?plain=1#L410-L446).
+[example](https://github.com/intersectmbo/io-sim/blob/main/io-classes/src/Control/Monad/Class/MonadSTM.hs?plain=1#L410-L446).
 Please keep this in mind when adding new functionality.
 
 # Roles and Responsibilities
@@ -55,7 +55,7 @@ package ouroboros-network-testing
 # Code Style
 
 Please follow the local style.  For a more detailed style guide see
-[link](https://github.com/input-output-hk/ouroboros-network/blob/master/docs/StyleGuide.md).
+[link](https://github.com/intersectmbo/ouroboros-network/blob/master/docs/StyleGuide.md).
 
 # Pull Requests
 
@@ -84,7 +84,7 @@ quite simple.
 ## Code Style
 
 Please follow the local style.  For a more detailed style guide see
-[link](https://github.com/input-output-hk/ouroboros-network/blob/master/docs/StyleGuide.md).
+[link](https://github.com/intersectmbo/ouroboros-network/blob/master/docs/StyleGuide.md).
 
 ## MonadSTM features
 
@@ -119,8 +119,8 @@ lazier than `IO` monad.  Thus if you want to use `Debug.Trace.traceM` inside
 
 
 
-[CHaP]: https://github.com/input-output-hk/cardano-haskell-packages/
+[CHaP]: https://github.com/intersectmbo/cardano-haskell-packages/
 [gh-link-issue]: https://docs.github.com/en/github/managing-your-work-on-github/linking-a-pull-request-to-an-issue
 [gh-signing-commits]: https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits
-[ci]: https://github.com/input-output-hk/io-sim/actions
+[ci]: https://github.com/intersectmbo/io-sim/actions
 
