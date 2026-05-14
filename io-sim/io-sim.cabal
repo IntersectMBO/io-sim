@@ -9,16 +9,16 @@ description:
 
   = Documentation
   Documentation is published
-  [here](https://input-output-hk.github.io/io-sim/io-sim).
+  [here](https://intersectmbo.github.io/io-sim/io-sim).
 license:             Apache-2.0
 license-files:       LICENSE NOTICE
-copyright:           2022-2025 Input Output Global Inc (IOG)
+copyright:           2022-2026 Input Output Global Inc (IOG) 2026 Intersect
 author:              Alexander Vieth, Duncan Coutts, John Hughes, Marcin Szamotulski
 maintainer:          Duncan Coutts duncan@well-typed.com, Marcin Szamotulski coot@coot.me
 category:            Testing
 build-type:          Simple
 extra-doc-files:     CHANGELOG.md README.md
-bug-reports:         https://github.com/input-output-hk/io-sim/issues
+bug-reports:         https://github.com/intersectmbo/io-sim/issues
 tested-with:         GHC == { 9.6, 9.8, 9.10, 9.12, 9.14 }
 
 flag asserts
@@ -28,7 +28,7 @@ flag asserts
 
 source-repository head
   type:     git
-  location: https://github.com/input-output-hk/io-sim
+  location: https://github.com/intersectmbo/io-sim
   subdir:   io-sim
 
 common test-warnings
