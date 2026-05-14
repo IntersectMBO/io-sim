@@ -361,7 +361,7 @@ data Failure =
        -- | An internal failure of the simulator.
        --
        -- Please open an issue at
-       -- <https://github.com/input-output-hk/io-sim/issues>.
+       -- <https://github.com/intersectmbo/io-sim/issues>.
      | FailureInternal String
   deriving Show
 
@@ -387,7 +387,7 @@ instance Exception Failure where
              , msg
              , ">>\n"
              , "please report the issue at\n"
-             , "https://github.com/input-output-hk/io-sim/issues"
+             , "https://github.com/intersectmbo/io-sim/issues"
              ]
 
 
@@ -500,7 +500,7 @@ runSimTrace mainAction = runST (runSimTraceST mainAction)
 -- /IOSimPOR/ is a different interpreter of 'IOSim' which has the ability to
 -- discover race conditions and replay the simulation using a schedule which
 -- reverts them.  For extended documentation how to use it see
--- [here](https://github.com/input-output-hk/io-sim/blob/main/io-sim/how-to-use-IOSimPOR.md).
+-- [here](https://github.com/intersectmbo/io-sim/blob/main/io-sim/how-to-use-IOSimPOR.md).
 --
 -- /IOSimPOR/ only discovers races between events which happen in the same time
 -- slot.  In /IOSim/ and /IOSimPOR/ time only moves explicitly through timer

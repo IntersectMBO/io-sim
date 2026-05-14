@@ -892,7 +892,7 @@ data SimResult a
     -- ^ Only returned by /IOSimPOR/ when a step execution took longer than
     -- 'explorationStepTimelimit` was exceeded.
     | InternalError String
-    -- ^ An `IOSim` bug, please report to <https://github.com/input-output-hk/io-sim>
+    -- ^ An `IOSim` bug, please report to <https://github.com/intersectmbo/io-sim>
     deriving (Show, Functor)
 
 ppSimResult :: Show a
