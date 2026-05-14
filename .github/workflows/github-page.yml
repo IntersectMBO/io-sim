@@ -63,7 +63,7 @@ jobs:
         cabal haddock-project --prologue=README.haddock --hackage all
 
     - name: Upload artifacts
-      uses: actions/upload-pages-artifact@v4
+      uses: actions/upload-pages-artifact@v5
       with:
         path: ./haddocks
 
