@@ -1,6 +1,6 @@
-[![Haskell CI](https://img.shields.io/github/actions/workflow/status/input-output-hk/io-sim/haskell.yml?branch=main&label=Build&style=for-the-badge)](https://github.com/input-output-hk/io-sim/actions/workflows/haskell.yml)
-[![handbook](https://img.shields.io/badge/policy-Cardano%20Engineering%20Handbook-informational?style=for-the-badge)](https://input-output-hk.github.io/cardano-engineering-handbook)
-[![Haddocks](https://img.shields.io/badge/documentation-Haddocks-pink?style=for-the-badge)](https://input-output-hk.github.io/io-sim)
+[![Haskell CI](https://img.shields.io/github/actions/workflow/status/intersectmbo/io-sim/haskell.yml?branch=main&label=Build&style=for-the-badge)](https://github.com/intersectmbo/io-sim/actions/workflows/haskell.yml)
+[![handbook](https://img.shields.io/badge/policy-Cardano%20Engineering%20Handbook-informational?style=for-the-badge)](https://intersectmbo.github.io/cardano-engineering-handbook)
+[![Haddocks](https://img.shields.io/badge/documentation-Haddocks-pink?style=for-the-badge)](https://intersectmbo.github.io/io-sim)
 
 # [`io-sim`]
 
@@ -75,10 +75,10 @@ New issues should be reported in [this][io-sim-issues] repository.
 [`io-sim`]: https://hackage.haskell.org/package/io-sim
 
 [contra-tracer]: https://hackage.haskell.org/package/contra-tracer
-[io-sim-issues]: https://github.com/input-output-hk/io-sim/issues
+[io-sim-issues]: https://github.com/intersectmbo/io-sim/issues
 [io-sim-por-how-to]: ./io-sim/how-to-use-IOSimPOR.md
-[io-sim-por]: https://github.com/input-output-hk/io-sim/blob/main/io-sim/how-to-use-IOSimPOR.md
-[ouroboros-network]: https://github.com/input-output-hk/ouroboros-network
+[io-sim-por]: https://github.com/intersectmbo/io-sim/blob/main/io-sim/how-to-use-IOSimPOR.md
+[ouroboros-network]: https://github.com/intersectmbo/ouroboros-network
 
 [`IOSim`]: https://hackage.haskell.org/package/io-sim/docs/Control-Monad-IOSim.html#t:IOSim
 

@@ -27,22 +27,22 @@ description:
 
   = Documentation
   Haddocks of all public sublibraries are published
-  [here](https://input-output-hk.github.io/io-sim).
+  [here](https://intersectmbo.github.io/io-sim).
 
 license:             Apache-2.0
 license-files:       LICENSE NOTICE
-copyright:           2019-2025 Input Output Global Inc (IOG)
+copyright:           2019-2026 Input Output Global Inc (IOG), 2026 Intersect
 author:              Alexander Vieth, Duncan Coutts, Marcin Szamotulski, Neil Davies, Thomas Winant
 maintainer:          Duncan Coutts duncan@well-typed.com, Marcin Szamotulski coot@coot.me
 category:            Control
 build-type:          Simple
 extra-doc-files:     CHANGELOG.md README.md strict-stm/README.md strict-mvar/README.md
-bug-reports:         https://github.com/input-output-hk/io-sim/issues
+bug-reports:         https://github.com/intersectmbo/io-sim/issues
 tested-with:         GHC == { 9.6, 9.8, 9.10, 9.12, 9.14 }
 
 source-repository head
   type:     git
-  location: https://github.com/input-output-hk/io-sim
+  location: https://github.com/intersectmbo/io-sim
   subdir:   io-classes
 
 flag asserts
