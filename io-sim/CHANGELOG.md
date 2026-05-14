@@ -1,5 +1,13 @@
 # Revision history of io-sim
 
+## next version
+
+### Breaking changes
+
+### Non-breaking changes
+
+* Repository moved to https://github.com/IntersectMBO/io-sim
+
 ## 1.10.1.0
 
 ### Non-breaking changes
