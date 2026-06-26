@@ -6,6 +6,7 @@
 
 ### Non-breaking changes
 
+* Added `ppSayTrace` which pritty prints `EventSay` which are coming from `say` usage.
 * Repository moved to https://github.com/IntersectMBO/io-sim
 
 ## 1.10.1.0
