@@ -58,6 +58,7 @@ module Control.Monad.IOSim
     -- ** Pretty printers
   , ppTrace
   , ppTrace_
+  , ppSayTrace
   , ppEvents
   , ppSimEvent
   , ppDebug
@@ -484,6 +485,16 @@ ppEvents events =
                 [ maybe 0 length threadLabel
                 | (_, _, threadLabel, _) <- events
                 ]
+
+
+-- | Filter `EventSay` and pretty print them.
+--
+ppSayTrace :: SimTrace a -> String
+ppSayTrace tr = ppEvents
+              [ a
+              | a@(_, _, _, EventSay {})
+                <- traceEvents tr
+              ]
 
 
 -- | See 'runSimTraceST' below.
