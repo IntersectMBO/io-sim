@@ -26,7 +26,7 @@ jobs:
       run: echo "CACHE_VERSION=pu4Aevoo_v1" >> $GITHUB_ENV
 
     - name: "Setup Haskell"
-      uses: haskell-actions/setup@v2.11.0
+      uses: haskell-actions/setup@v2.12.0
       id: setup-haskell
       with:
         ghc-version: ${{ matrix.ghc }}
