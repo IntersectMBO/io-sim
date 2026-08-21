@@ -1,4 +1,9 @@
-module Control.Monad.Class.MonadEventlog (MonadEventlog (..)) where
+module Control.Monad.Class.MonadEventlog
+  ( MonadEventlog (..)
+    -- Re-exports
+  , IO.traceEvent
+  , IO.traceMarker
+  ) where
 
 import Control.Monad.Reader
 
