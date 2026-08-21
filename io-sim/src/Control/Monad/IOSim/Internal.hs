@@ -56,7 +56,6 @@ import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Time (UTCTime (..), fromGregorian)
 
-import Control.DeepSeq (force)
 import Control.Exception (NonTermination (..), SomeAsyncException, assert,
            throw)
 import Control.Monad (join, when)
@@ -314,36 +313,14 @@ schedule !thread@Thread{
                  $ trace
 
     Say msg k -> do
-      mbNF <- unsafeIOToST $ tryJust (\e -> case fromException @SomeAsyncException e of
-                                        Nothing -> Just e
-                                        Just {} -> Nothing)
-                           $ evaluate (force msg)
-      case mbNF of
-        Left e -> do
-          let thread' = thread { threadControl = ThreadControl (Throw e) ctl }
-          trace <- schedule thread' simstate
-          return $ SimTrace time tid tlbl (EventSayEvaluationError e)
-                 $ trace
-        Right msg' -> do
-          let thread' = thread { threadControl = ThreadControl k ctl }
-          trace <- schedule thread' simstate
-          return (SimTrace time tid tlbl (EventSay msg') trace)
+      let thread' = thread { threadControl = ThreadControl k ctl }
+      trace <- schedule thread' simstate
+      return (SimTrace time tid tlbl (EventSay msg) trace)
 
-    Output x@(Dynamic _ x') k -> do
-      mbWHNF <- unsafeIOToST $ tryJust (\e -> case fromException @SomeAsyncException e of
-                                          Nothing -> Just e
-                                          Just {} -> Nothing)
-                             $ evaluate x'
-      case mbWHNF of
-        Left e -> do
-          let thread' = thread { threadControl = ThreadControl (Throw e) ctl }
-          trace <- schedule thread' simstate
-          return $ SimTrace time tid tlbl (EventLogEvaluationError e)
-                 $ trace
-        Right {} -> do
-          let thread' = thread { threadControl = ThreadControl k ctl }
-          trace <- schedule thread' simstate
-          return (SimTrace time tid tlbl (EventLog x) trace)
+    Output x k -> do
+      let thread' = thread { threadControl = ThreadControl k ctl }
+      trace <- schedule thread' simstate
+      return (SimTrace time tid tlbl (EventLog x) trace)
 
     LiftST st k -> do
       x <- strictToLazyST st
@@ -1125,8 +1102,25 @@ execAtomically !time !tid !tlbl !nextVid0 !action0 !k0 =
           -- Skip the right hand alternative and continue with the k continuation
           go ctl' read written' writtenSeq' createdSeq' nextVid (k x)
 
-      ThrowStm e ->
-        throwStm ctl read written nextVid e
+      ThrowStm e -> do
+        -- Rollback `TVar`s written since catch handler was installed
+        !_ <- traverse_ (\(SomeTVar tvar) -> revertTVar tvar) written
+        case ctl of
+          AtomicallyFrame -> do
+            k0 $ StmTxAborted (Map.elems read) (toException e)
+
+          BranchFrame (CatchStmA h) k writtenOuter writtenOuterSeq createdOuterSeq ctl' -> do
+            -- Execute the left side in a new frame with an empty written set.
+            -- but preserve ones that were set prior to it, as specified in the
+            -- [stm](https://hackage.haskell.org/package/stm/docs/Control-Monad-STM.html#v:catchSTM) package.
+            let ctl'' = BranchFrame NoOpStmA k writtenOuter writtenOuterSeq createdOuterSeq ctl'
+            go ctl'' read Map.empty [] [] nextVid (h e)
+
+          BranchFrame (OrElseStmA _r) _k writtenOuter writtenOuterSeq createdOuterSeq ctl' -> do
+            go ctl' read writtenOuter writtenOuterSeq createdOuterSeq nextVid (ThrowStm e)
+
+          BranchFrame NoOpStmA _k writtenOuter writtenOuterSeq createdOuterSeq ctl' -> do
+            go ctl' read writtenOuter writtenOuterSeq createdOuterSeq nextVid (ThrowStm e)
 
       CatchStm a h k -> do
         -- Execute the catch handler with an empty written set.
@@ -1194,32 +1188,12 @@ execAtomically !time !tid !tlbl !nextVid0 !action0 !k0 =
             go ctl read written' (SomeTVar v : writtenSeq) createdSeq nextVid k
 
       SayStm msg k -> do
-        mbNF <- unsafeIOToST $ tryJust (\e -> case fromException @SomeAsyncException e of
-                                          Nothing -> Just e
-                                          Just {} -> Nothing)
-                             $ evaluate (force msg)
-        case mbNF of
-          Left e -> do
-            trace <- throwStm ctl read written nextVid e
-            return $ SimTrace time tid tlbl (EventSayEvaluationError e)
-                   $ trace
-          Right msg' -> do
-            trace <- go ctl read written writtenSeq createdSeq nextVid k
-            return $ SimTrace time tid tlbl (EventSay msg') trace
+        trace <- go ctl read written writtenSeq createdSeq nextVid k
+        return $ SimTrace time tid tlbl (EventSay msg) trace
 
-      OutputStm x@(Dynamic _ x') k -> do
-        mbWHNF <- unsafeIOToST $ tryJust (\e -> case fromException @SomeAsyncException e of
-                                            Nothing -> Just e
-                                            Just {} -> Nothing)
-                               $ evaluate x'
-        case mbWHNF of
-          Left e -> do
-            trace <- throwStm ctl read written nextVid e
-            return $ SimTrace time tid tlbl (EventLogEvaluationError e)
-                   $ trace
-          Right {} -> do
-            trace <- go ctl read written writtenSeq createdSeq nextVid k
-            return $ SimTrace time tid tlbl (EventLog x) trace
+      OutputStm x k -> do
+        trace <- go ctl read written writtenSeq createdSeq nextVid k
+        return $ SimTrace time tid tlbl (EventLog x) trace
 
       LiftSTStm st k -> do
         x <- strictToLazyST st
@@ -1236,34 +1210,6 @@ execAtomically !time !tid !tlbl !nextVid0 !action0 !k0 =
         localInvariant =
             Map.keysSet written
          == Set.fromList [ tvarId tvar | SomeTVar tvar <- writtenSeq ]
-
-    -- throw an exception in an STM transaction
-    throwStm :: forall b.
-                StmStack s b a
-             -> Map TVarId (SomeTVar s)
-             -> Map TVarId (SomeTVar s)
-             -> VarId
-             -> SomeException
-             -> ST s (SimTrace c)
-    throwStm ctl read written nextVid e = do
-      -- Rollback `TVar`s written since catch handler was installed
-      !_ <- traverse_ (\(SomeTVar tvar) -> revertTVar tvar) written
-      case ctl of
-        AtomicallyFrame -> do
-          k0 $ StmTxAborted (Map.elems read) (toException e)
-
-        BranchFrame (CatchStmA h) k writtenOuter writtenOuterSeq createdOuterSeq ctl' -> do
-          -- Execute the left side in a new frame with an empty written set.
-          -- but preserve ones that were set prior to it, as specified in the
-          -- [stm](https://hackage.haskell.org/package/stm/docs/Control-Monad-STM.html#v:catchSTM) package.
-          let ctl'' = BranchFrame NoOpStmA k writtenOuter writtenOuterSeq createdOuterSeq ctl'
-          go ctl'' read Map.empty [] [] nextVid (h e)
-
-        BranchFrame (OrElseStmA _r) _k writtenOuter writtenOuterSeq createdOuterSeq ctl' -> do
-          go ctl' read writtenOuter writtenOuterSeq createdOuterSeq nextVid (ThrowStm e)
-
-        BranchFrame NoOpStmA _k writtenOuter writtenOuterSeq createdOuterSeq ctl' -> do
-          go ctl' read writtenOuter writtenOuterSeq createdOuterSeq nextVid (ThrowStm e)
 
 
 -- | Special case of 'execAtomically' supporting only var reads and writes

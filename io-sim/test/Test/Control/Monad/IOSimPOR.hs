@@ -6,7 +6,6 @@
 
 module Test.Control.Monad.IOSimPOR (tests) where
 
-import Data.Bifoldable (bifoldMap)
 import Data.Fixed (Micro)
 #if __GLASGOW_HASKELL__ >= 910
 import Data.Foldable (traverse_)
@@ -21,7 +20,7 @@ import Data.Map qualified as Map
 import System.Exit
 import System.IO.Error (ioeGetErrorString, isUserError)
 
-import Control.Exception (ArithException (..), AsyncException, ErrorCall (..))
+import Control.Exception (ArithException (..), AsyncException)
 import Control.Monad
 import Control.Monad.Fix
 
@@ -38,8 +37,8 @@ import Control.Monad.IOSim
 import GHC.Generics
 
 import Test.Control.Monad.IOSim (ActionDuration, TimeoutDuration,
-           TraceBottom (..), WithSanityCheck (..), ignoreSanityCheck,
-           isSanityCheckIgnored, singleTimeoutExperiment, withSanityCheck)
+           WithSanityCheck (..), ignoreSanityCheck, isSanityCheckIgnored,
+           singleTimeoutExperiment, withSanityCheck)
 import Test.Control.Monad.STM
 import Test.Control.Monad.Utils
 
@@ -78,12 +77,6 @@ tests =
       , testProperty "timeouts"               prop_timeouts
       , testProperty "stacked timeouts"       prop_stacked_timeouts
       , testProperty "{register,thread}Delay" unit_registerDelay_threadDelay
-      , testGroup "trace bottom"
-        [ testProperty "say"                  unit_trace_bottom_say
-        , testProperty "dynamic"              unit_trace_bottom_dynamic
-        , testProperty "saySTM"               unit_trace_bottom_saySTM
-        , testProperty "dynamicSTM"           unit_trace_bottom_dynamicSTM
-        ]
       ]
     , testProperty "infinite simulation"      prop_explore_endless_simulation
     , testProperty "threadId order (IOSim)"   (withNumTests 1000 prop_threadId_order_order_Sim)
@@ -1090,49 +1083,6 @@ unit_registerDelay_threadDelay =
       t1 <- getMonotonicTime
 
       return (t1 `diffTime` t0 === delay)
-
-
-prop_trace_bottom :: TraceBottom -> Property
-prop_trace_bottom tb =
-    exploreSimTrace id sim $ \_ trace ->
-      property $
-      bifoldMap
-        (\_ -> Some False)
-        (\ev ->
-          case seType ev of
-            EventSayEvaluationError e
-              | Just ErrorCall{} <- fromException e
-              -> Some True
-            EventLogEvaluationError e
-              | Just ErrorCall{} <- fromException e
-              -> Some True
-            _ -> Some False
-        )
-        trace
-  where
-    sim :: IOSim s ()
-    sim = case tb of
-      TraceBottomSay ->
-        say (error "bottom")
-      TraceBottomDynamic ->
-        traceM (error "bottom" :: String)
-      TraceBottomSaySTM ->
-        atomically $ say (error "bottom")
-      TraceBottomDynamicSTM ->
-        atomically $ traceSTM (error "bottom" :: String)
-
-unit_trace_bottom_say :: Property
-unit_trace_bottom_say = once (prop_trace_bottom TraceBottomSay)
-
-unit_trace_bottom_dynamic :: Property
-unit_trace_bottom_dynamic = once (prop_trace_bottom TraceBottomDynamic)
-
-unit_trace_bottom_saySTM :: Property
-unit_trace_bottom_saySTM = once (prop_trace_bottom TraceBottomSaySTM)
-
-unit_trace_bottom_dynamicSTM :: Property
-unit_trace_bottom_dynamicSTM = once (prop_trace_bottom TraceBottomDynamicSTM)
-
 
 unit_timeouts_and_async_exceptions_1 :: Property
 unit_timeouts_and_async_exceptions_1 =

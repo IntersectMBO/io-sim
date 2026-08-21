@@ -367,7 +367,7 @@ data Failure =
   deriving Show
 
 instance Exception Failure where
-    displayException (FailureException err) = displayException err
+    displayException (FailureException err) = displayException  err
     displayException (FailureDeadlock threads) =
       concat [ "<<io-sim deadlock: "
              , intercalate ", " (show `map` threads)

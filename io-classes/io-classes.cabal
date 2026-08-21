@@ -1,6 +1,6 @@
 cabal-version:       3.4
 name:                io-classes
-version:             1.10.1.0
+version:             1.11.0.0
 synopsis:            Type classes for concurrency with STM, ST and timing
 description:
   IO Monad class hierarchy compatible with:

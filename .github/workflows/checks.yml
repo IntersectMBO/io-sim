@@ -46,8 +46,8 @@ jobs:
       uses: haskell-actions/setup@v2.11.0
       id: setup-haskell
       with:
-        ghc-version: 9.6.3
-        cabal-version: 3.10.1.0
+        ghc-version: 9.6.7
+        cabal-version: 3.14.2.0
 
     - name: "Setup cabal bin path"
       run: |
