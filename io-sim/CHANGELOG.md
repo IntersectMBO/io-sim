@@ -4,11 +4,17 @@
 
 ### Breaking changes
 
+* Removed `EventSayEvaluationError` and `EventLogEvaluationError`.
+
 ### Non-breaking changes
 
 * Added `ppSayTrace` which pritty prints `EventSay` which are coming from `say` usage.
 * Repository moved to https://github.com/IntersectMBO/io-sim
 * Exported `traceMarker`, `traceEvent` from `Control.Monad.Class.MonadEventlog`.
+* `say`, `traceM` and `traceSTM` no longer evaluate their arguments to _NF_ or
+  _WHNF_.  This is dropped since it introduced a performance regression in
+  `io-sim-1.10` on large tests which include `say` used just for debugging
+  purposes.
 
 ## 1.10.1.0
 
