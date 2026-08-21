@@ -145,17 +145,11 @@ runIOSim (IOSim k) = k Return
 -- can then be recovered with `selectTraceEventsDynamic` or
 -- `selectTraceEventsDynamic'`.
 --
--- Note: `traceM` evaluates the `a` to `WHNF`, exceptions are thrown by the
--- current thread and the trace will include `EventLogEvaluationError`.
---
 traceM :: Typeable a => a -> IOSim s ()
-traceM x = IOSim $ oneShot $ \k -> Output (toDyn x) (k ())
+traceM !x = IOSim $ oneShot $ \k -> Output (toDyn x) (k ())
 
 -- | Trace a value, in the same was as `traceM` does, but from the `STM` monad.
 -- This is primarily useful for debugging.
---
--- Note: `traceSTM` evaluates the `a` to `WHNF`, if exception is thrown, the
--- trace will end with `TraceException`.
 --
 traceSTM :: Typeable a => a -> STMSim s ()
 traceSTM x = STM $ oneShot $ \k -> OutputStm (toDyn x) (k ())
@@ -339,10 +333,6 @@ instance MonadPlus (STM s) where
 instance MonadFix (STM s) where
     mfix f = STM $ oneShot $ \k -> FixStm f k
 
--- | `IOSim s` instance is strict: the string will be evaluated to normal form,
--- if an exception is encountered it is thrown in the current thread, and the
--- log will contain `EventSayEvaluationError`.
---
 instance MonadSay (IOSim s) where
   say msg = IOSim $ oneShot $ \k -> Say msg (k ())
 
@@ -493,10 +483,6 @@ instance MonadFork (IOSim s) where
 instance MonadTest (IOSim s) where
   exploreRaces       = IOSim $ oneShot $ \k -> ExploreRaces (k ())
 
--- | `STM (IOSim s)` instance is strict: the string will be evaluated to normal
--- form, if an exception is encountered the trace will finish with
--- `TraceException`.
---
 instance MonadSay (STMSim s) where
   say msg = STM $ oneShot $ \k -> SayStm msg (k ())
 
@@ -1056,13 +1042,9 @@ pattern TraceInternalError msg = Trace.Nil (InternalError msg)
 --
 data SimEventType
   = EventSay  String
-  -- ^ holds value of `say`
-  | EventSayEvaluationError SomeException
-  -- ^ holds error resulted from evaluation of the expression passed to `say` to NF.
+  -- ^ hold value of `say`
   | EventLog  Dynamic
-  -- ^ holds a dynamic value of `Control.Monad.IOSim.traceM`
-  | EventLogEvaluationError SomeException
-  -- ^ holds error resulted from evaluation of the expression passed to `traceM` to WHNF.
+  -- ^ hold a dynamic value of `Control.Monad.IOSim.traceM`
   | EventMask MaskingState
   -- ^ masking state changed
 
@@ -1192,9 +1174,7 @@ unsafeEvaluateString name a = unsafePerformIO $
 ppSimEventType :: SimEventType -> String
 ppSimEventType = \case
   EventSay a -> "Say " ++ a
-  EventSayEvaluationError err -> "SayEvaluationError " ++ show err
   EventLog a -> "Dynamic " ++ show a
-  EventLogEvaluationError err -> "DynamicEvaluationError " ++ show err
   EventMask a -> "Mask " ++ show a
   EventThrow err -> "Throw " ++ unsafeEvaluateString "exception" (show err)
   EventThrowTo err tid ->

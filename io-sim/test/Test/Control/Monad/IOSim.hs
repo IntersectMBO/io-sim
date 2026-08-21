@@ -17,10 +17,8 @@ module Test.Control.Monad.IOSim
   , TimeoutDuration
   , ActionDuration
   , singleTimeoutExperiment
-  , TraceBottom (..)
   ) where
 
-import Data.Bifoldable (bifoldMap)
 import Data.Either (isLeft)
 import Data.Fixed (Micro)
 #if __GLASGOW_HASKELL__ < 910
@@ -29,7 +27,7 @@ import Data.Foldable (foldl')
 import Data.Functor (($>))
 import Data.Time.Clock (picosecondsToDiffTime)
 
-import Control.Exception (ArithException (..), AsyncException, ErrorCall (..))
+import Control.Exception (ArithException (..), AsyncException)
 import Control.Monad
 import Control.Monad.Fix
 import System.IO.Error (ioeGetErrorString, isUserError)
@@ -72,12 +70,6 @@ tests =
     , testProperty "threadDelay and STM"    unit_threadDelay_and_stm
     , testProperty "{register,thread}Delay" unit_registerDelay_threadDelay
     , testProperty "throwTo and STM"        unit_throwTo_and_stm
-    , testGroup "trace bottom"
-      [ testProperty "say"                  unit_trace_bottom_say
-      , testProperty "dynamic"              unit_trace_bottom_dynamic
-      , testProperty "saySTM"               unit_trace_bottom_saySTM
-      , testProperty "dynamicSTM"           unit_trace_bottom_dynamicSTM
-      ]
     ]
   , testGroup "QuickCheck"
     [ testProperty "timeout: discardAfter"  unit_discardAfter
@@ -1286,54 +1278,6 @@ unit_throwTo_and_stm = once $
       t1 <- getMonotonicTime
 
       return (t1 `diffTime` t0 === delay)
-
-
-data TraceBottom = TraceBottomSay
-                 | TraceBottomDynamic
-                 | TraceBottomSaySTM
-                 | TraceBottomDynamicSTM
-
-prop_trace_bottom :: TraceBottom -> Property
-prop_trace_bottom tb =
-    let trace = runSimTrace sim in
-    property $
-    bifoldMap
-      (\_ -> Some False)
-      (\ev ->
-        case seType ev of
-          EventSayEvaluationError e
-            | Just ErrorCall{} <- fromException e
-            -> Some True
-          EventLogEvaluationError e
-            | Just ErrorCall{} <- fromException e
-            -> Some True
-          _ -> Some False
-      )
-      trace
-  where
-    sim :: IOSim s ()
-    sim = case tb of
-      TraceBottomSay ->
-        say (error "bottom")
-      TraceBottomDynamic ->
-        traceM (error "bottom" :: String)
-      TraceBottomSaySTM ->
-        atomically $ say (error "bottom")
-      TraceBottomDynamicSTM ->
-        atomically $ traceSTM (error "bottom" :: String)
-
-unit_trace_bottom_say :: Property
-unit_trace_bottom_say = once (prop_trace_bottom TraceBottomSay)
-
-unit_trace_bottom_dynamic :: Property
-unit_trace_bottom_dynamic = once (prop_trace_bottom TraceBottomDynamic)
-
-unit_trace_bottom_saySTM :: Property
-unit_trace_bottom_saySTM = once (prop_trace_bottom TraceBottomSaySTM)
-
-unit_trace_bottom_dynamicSTM :: Property
-unit_trace_bottom_dynamicSTM = once (prop_trace_bottom TraceBottomDynamicSTM)
-
 
 --
 -- MonadMask properties
