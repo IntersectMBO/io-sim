@@ -43,7 +43,7 @@ jobs:
         sudo apt-get -y install fd-find
 
     - name: "Setup Haskell"
-      uses: haskell-actions/setup@v2.11.0
+      uses: haskell-actions/setup@v2.12.0
       id: setup-haskell
       with:
         ghc-version: 9.6.7
