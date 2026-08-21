@@ -152,7 +152,7 @@ traceM !x = IOSim $ oneShot $ \k -> Output (toDyn x) (k ())
 -- This is primarily useful for debugging.
 --
 traceSTM :: Typeable a => a -> STMSim s ()
-traceSTM x = STM $ oneShot $ \k -> OutputStm (toDyn x) (k ())
+traceSTM !x = STM $ oneShot $ \k -> OutputStm (toDyn x) (k ())
 
 data Thrower = ThrowSelf | ThrowOther deriving (Ord, Eq, Show)
 
