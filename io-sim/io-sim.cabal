@@ -55,6 +55,7 @@ library
                        Control.Monad.IOSim.Internal,
                        Control.Monad.IOSim.InternalTypes,
                        Control.Monad.IOSim.STM,
+                       Control.Monad.IOSim.IORef,
                        Control.Monad.IOSimPOR.Internal,
                        Control.Monad.IOSimPOR.Types,
                        Control.Monad.IOSimPOR.QuickCheckUtils,
