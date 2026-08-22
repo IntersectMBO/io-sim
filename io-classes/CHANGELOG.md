@@ -9,6 +9,8 @@
 ### Non-breaking changes
 
 * Repository moved to https://github.com/IntersectMBO/io-sim
+* `Control.Concurrent.Class.MonadSTM.TChan` now exports `labelTChan` and `labelTChanIO`
+* `io-classes:strict-stm`: `Control.Concurrent.Class.MonadSTM.Strict.TChan` now exports `labelTChan` and `labelTChanIO`
 
 ## 1.10.1.0
 
