@@ -1,5 +1,15 @@
 # Revsion history of io-classes
 
+## next version
+
+### Breaking changes
+
+### Non-breaking changes
+
+- Added `TimeDuration` type class for `Time` and `UTCTime`.  This generalised
+  `diffTime` and `addTime` to both `Time` and `UTCTime` allowing libraries that
+  depend on `Time`/`UTCTime` abstract over the time measure.
+
 ## 1.11.0.0
 
 ### Breaking changes
