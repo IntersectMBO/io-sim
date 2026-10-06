@@ -10,14 +10,11 @@ module Control.Monad.Class.MonadTimer
   , MonadTimer (..)
   ) where
 
-import Control.Concurrent qualified as IO
 import Control.Concurrent.Class.MonadSTM
-import Control.Concurrent.STM.TVar qualified as STM
+import Control.Monad.Class.MonadTimer.IO qualified as IO
 
 import Control.Monad.Reader (ReaderT (..))
 import Control.Monad.Trans (lift)
-
-import System.Timeout qualified as IO
 
 -- | A typeclass to delay current thread.
 class Monad m => MonadDelay m where
@@ -40,6 +37,9 @@ class (MonadDelay m, MonadSTM m) => MonadTimer m where
 --
 -- Instances for IO
 --
+-- These go through the process-wide timer service of
+-- "Control.Monad.Class.MonadTimer.IO"; see there for why.
+--
 
 instance MonadDelay IO where
   threadDelay = IO.threadDelay
@@ -47,7 +47,7 @@ instance MonadDelay IO where
 
 instance MonadTimer IO where
 
-  registerDelay = STM.registerDelay
+  registerDelay = IO.registerDelay
   timeout = IO.timeout
 
 --

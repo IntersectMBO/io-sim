@@ -1,5 +1,18 @@
 # Revsion history of io-classes
 
+### next version
+
+### Non-breaking changes
+
+* The `IO` instances of `MonadDelay` and `MonadTimer`, and the cancellable
+  timers of `si-timers`, register with one process-wide timer service
+  (`Control.Monad.Class.MonadTimer.IO`) instead of each going to GHC's timer
+  manager.  GHC keeps its timeouts in one `IORef` updated lazily, and with a
+  few hundred threads using timers at once every timer in the process could
+  stall for seconds.  Timers are still fired from GHC's callback, so no
+  wake-up is added in front of a waiting thread.
+* `io-classes` now depends on `containers`.
+
 ### 1.8.0.1
 
 * Added support for `ghc-9.2`.

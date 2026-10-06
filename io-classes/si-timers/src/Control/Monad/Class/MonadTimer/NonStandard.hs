@@ -43,8 +43,8 @@ import Control.Monad (when)
 import Control.Monad.Class.MonadSTM
 
 #ifdef GHC_TIMERS_API
-import GHC.Event qualified as GHC (TimeoutKey, getSystemTimerManager,
-           registerTimeout, unregisterTimeout)
+import Control.Monad.Class.MonadTimer.IO (Fire (..), TimerKey, cancelFire,
+           registerFire)
 #else
 import GHC.Conc.IO qualified as GHC (registerDelay)
 #endif
@@ -60,7 +60,7 @@ data TimeoutState = TimeoutPending | TimeoutFired | TimeoutCancelled
 -- 'cancelTimeout'.
 --
 #ifdef GHC_TIMERS_API
-data Timeout = TimeoutIO !(STM.TVar TimeoutState) !GHC.TimeoutKey
+data Timeout = TimeoutIO !(STM.TVar TimeoutState) !TimerKey
 #else
 data Timeout = TimeoutIO !(STM.TVar (STM.TVar Bool)) !(STM.TVar Bool)
 #endif
@@ -78,7 +78,7 @@ data Timeout = TimeoutIO !(STM.TVar (STM.TVar Bool)) !(STM.TVar Bool)
 -- this functionality.
 --
 -- When native timer manager is supported (on `*nix` systems), it only holds
--- a `TVar` with `TimeoutState` and `GHC.TimeoutKey`.
+-- a `TVar` with `TimeoutState` and the timer service's `TimerKey`.
 --
 newTimeout :: NewTimeout IO Timeout
 type NewTimeout m timeout = Int -> m timeout
@@ -117,8 +117,7 @@ readTimeout (TimeoutIO var _key) = STM.readTVar var
 
 newTimeout = \d -> do
     var <- STM.newTVarIO TimeoutPending
-    mgr <- GHC.getSystemTimerManager
-    key <- GHC.registerTimeout mgr d (STM.atomically (timeoutAction var))
+    key <- registerFire d (Fire (timeoutAction var) (return ()))
     return (TimeoutIO var key)
   where
     timeoutAction var = do
@@ -135,8 +134,7 @@ cancelTimeout (TimeoutIO var key) = do
         TimeoutPending   -> STM.writeTVar var TimeoutCancelled
         TimeoutFired     -> return ()
         TimeoutCancelled -> return ()
-    mgr <- GHC.getSystemTimerManager
-    GHC.unregisterTimeout mgr key
+    cancelFire key
 
 #else
 

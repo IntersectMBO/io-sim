@@ -86,6 +86,7 @@ library
                        Control.Monad.Class.MonadThrow
                        Control.Monad.Class.MonadTime
                        Control.Monad.Class.MonadTimer
+                       Control.Monad.Class.MonadTimer.IO
                        Control.Monad.Class.MonadTest
   default-language:    GHC2021
   default-extensions:  LambdaCase
@@ -93,6 +94,7 @@ library
                        array,
                        async >=2.1 && <2.3,
                        bytestring,
+                       containers,
                        mtl   >=2.2 && <2.4,
                        primitive >= 0.7 && <0.11,
                        stm   >=2.5 && <2.5.2 || ^>=2.5.3,
@@ -219,13 +221,16 @@ test-suite test-si-timers
   type:                exitcode-stdio-1.0
   hs-source-dirs:      si-timers/test
   main-is:             Main.hs
+  ghc-options:         -threaded -rtsopts "-with-rtsopts=-N2 -M2G"
   other-modules:       Test.MonadTimer
+                       Test.MonadTimer.IO
   default-language:    GHC2021
   default-extensions:  LambdaCase
   build-depends:       base,
+                       stm,
 
                        QuickCheck,
                        tasty,
                        tasty-quickcheck,
 
-                       io-classes:si-timers
+                       io-classes:{io-classes,si-timers}
