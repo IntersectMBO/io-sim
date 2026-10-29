@@ -504,8 +504,7 @@ schedule !thread@Thread{
       return (SimTrace time tid tlbl (EventThreadForked tid') trace)
 
     Atomically a k ->
-      execAtomically time tid tlbl nextVid (runSTM a) $ \res ->
-      case res of
+      execAtomically time tid tlbl nextVid (runSTM a) $ \case
         StmTxCommitted x written _read created
                          tvarDynamicTraces tvarStringTraces nextVid' -> do
           (!wakeup, wokeby) <- threadsUnblockedByWrites written
