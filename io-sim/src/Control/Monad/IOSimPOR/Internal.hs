@@ -356,18 +356,31 @@ schedule thread@Thread{
           -- We cannot do `tryPutMVar` in the `treadAction`, because we need to
           -- know if the `lock` is empty right now when we still have the frame.
           v <- execTryPutTMVar lock undefined
-          let -- Kill the assassin throwing thread then unmask exceptions and
-              -- carry on the continuation
-              threadAction :: IOSim s ()
-              threadAction =
-                if v then unsafeUnregisterTimeout tmid
-                     else atomically (takeTMVar lock) >>= killThread
-
-              thread' =
+          -- Either unregister the timeout, or kill the assassin throwing
+          -- thread, then carry on the continuation.
+          --
+          -- If the assassin holds the lock, we take it here rather than with
+          -- `atomically` in the `threadAction`: committing a transaction
+          -- yields, and the assassin could throw before we kill it, after the
+          -- frame is gone.  `killThread` does not yield before the exception
+          -- is delivered, and the assassin is unmasked, so it never blocks.
+          threadAction :: IOSim s () <-
+            if v then return (unsafeUnregisterTimeout tmid)
+                 else killThread <$> execTakeTMVar lock
+          let thread' =
                 thread { threadControl =
                           ThreadControl (case threadAction of
                                           IOSim k' -> k' (\() -> k (Just x)))
                                         ctl'
+                         -- If the assassin has already thrown, but we were not
+                         -- interruptible, its exception is pending.  Killing
+                         -- the assassin does not retract it (unlike in GHC's
+                         -- RTS), so we drop it here: otherwise it would be
+                         -- raised outside of the frame.
+                       , threadThrowTo =
+                           filter (\(e, _, _) -> fromException e
+                                              /= Just (TimeoutException tmid))
+                                  (threadThrowTo thread)
                        }
           schedule thread' simstate
 
@@ -1228,6 +1241,7 @@ forkTimeoutInterruptThreads timeoutExpired simState =
                            threadControl =
                             ThreadControl
                               (runIOSim $ do
+                                 -- assassin thread
                                  mtid <- myThreadId
                                  v2 <- atomically $ tryPutTMVar lock mtid
                                  when v2 $
@@ -1615,6 +1629,15 @@ execTryPutTMVar (TMVar var) a = do
               >> return True
       Just _  -> return False
 {-# INLINE execTryPutTMVar #-}
+
+execTakeTMVar :: TMVar (IOSim s) a -> ST s a
+execTakeTMVar (TMVar var) = do
+    v <- execReadTVar var
+    case v of
+      Just a  -> execWriteTVar var Nothing
+              >> return a
+      Nothing -> error "execTakeTMVar: empty TMVar"
+{-# INLINE execTakeTMVar #-}
 
 saveTVar :: TVar s a -> ST s ()
 saveTVar TVar{tvarCurrent, tvarUndo} = do

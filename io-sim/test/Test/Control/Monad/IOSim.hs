@@ -67,6 +67,10 @@ tests =
     , testProperty "async exceptions 1"     unit_timeouts_and_async_exceptions_1
     , testProperty "async exceptions 2"     unit_timeouts_and_async_exceptions_2
     , testProperty "async exceptions 3"     unit_timeouts_and_async_exceptions_3
+    , testProperty "assassin: pending throw"
+    $ forall_masking_states unit_timeout_assassin_pending_throw
+    , testProperty "assassin: holds the lock"
+    $ forall_masking_states unit_timeout_assassin_holds_lock
     , testProperty "threadDelay and STM"    unit_threadDelay_and_stm
     , testProperty "{register,thread}Delay" unit_registerDelay_threadDelay
     , testProperty "throwTo and STM"        unit_throwTo_and_stm
@@ -1184,6 +1188,60 @@ unit_timeouts_and_async_exceptions_3 = once $
       killThread tid
       threadDelay 1
       return $ property True
+
+
+-- | The assassin of a `timeout` throws while the timed thread is masked and
+-- runnable, so its exception is pending when the action finishes.  It must
+-- not be raised after `timeout` returns (#269).
+--
+-- The flag is set when the timeout fires.  The writer runs first (woken by its
+-- timer), then the assassin (forked at the same time, queued after it), then
+-- the timed thread (woken by the write).
+--
+unit_timeout_assassin_pending_throw :: MaskingState -> Property
+unit_timeout_assassin_pending_throw ms = once $
+    let trace = runSimTrace experiment in
+        counterexample (ppTrace_ trace)
+      . either (\e -> counterexample (show e) False) id
+      . traceResult False
+      $ trace
+  where
+    experiment :: IOSim s Property
+    experiment = do
+      flag <- newTVarIO False
+      _ <- forkIO $ threadDelay 1 >> atomically (writeTVar flag True)
+      r <- setMaskingState_ ms $
+             timeout 1 (atomically (readTVar flag >>= check))
+      return $ case ms of
+        -- the exception is delivered within the `timeout`
+        Unmasked -> r === Nothing
+        -- the exception is pending until the action finishes
+        _        -> r === Just ()
+
+
+-- | The assassin of a `timeout` takes the lock, but the action finishes
+-- before it throws.  The exception must not be raised after `timeout`
+-- returns (#269).
+--
+-- The timed thread is woken by its `threadDelay` timer before the assassin is
+-- forked, and yields once more (on `atomically`) before it finishes.  The
+-- assassin takes the lock in between.
+--
+unit_timeout_assassin_holds_lock :: MaskingState -> Property
+unit_timeout_assassin_holds_lock ms = once $
+    let trace = runSimTrace experiment in
+        counterexample (ppTrace_ trace)
+      . either (\e -> counterexample (show e) False) id
+      . traceResult False
+      $ trace
+  where
+    experiment :: IOSim s Property
+    experiment = do
+      r <- setMaskingState_ ms $
+             timeout 1 (threadDelay 1 >> atomically (return ()))
+      -- let the assassin run, if it's still alive
+      threadDelay 1
+      return (r === Just ())
 
 
 -- | Verify that a thread blocked on `threadDelay` is not unblocked by an STM
