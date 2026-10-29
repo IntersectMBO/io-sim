@@ -67,6 +67,10 @@ tests =
     , testProperty "async exceptions 1"     unit_timeouts_and_async_exceptions_1
     , testProperty "async exceptions 2"     unit_timeouts_and_async_exceptions_2
     , testProperty "async exceptions 3"     unit_timeouts_and_async_exceptions_3
+    , testProperty "assassin: holds the lock"
+    $ forall_masking_states unit_timeout_assassin_holds_lock
+    , testProperty "forwarded timeout exception"
+                                            unit_timeout_forwarded_exception
     , testProperty "threadDelay and STM"    unit_threadDelay_and_stm
     , testProperty "{register,thread}Delay" unit_registerDelay_threadDelay
     , testProperty "throwTo and STM"        unit_throwTo_and_stm
@@ -1184,6 +1188,65 @@ unit_timeouts_and_async_exceptions_3 = once $
       killThread tid
       threadDelay 1
       return $ property True
+
+
+-- | The assassin of a `timeout` takes the lock, but the action finishes
+-- before it throws.  The exception must not be raised after `timeout`
+-- returns (#269).
+--
+-- The timed thread is woken by its `threadDelay` timer before the assassin is
+-- forked, and yields once more (on `atomically`) before it finishes.  The
+-- assassin takes the lock in between.
+--
+unit_timeout_assassin_holds_lock :: MaskingState -> Property
+unit_timeout_assassin_holds_lock ms = once $
+    let trace = runSimTrace experiment in
+        counterexample (ppTrace_ trace)
+      . either (\e -> counterexample (show e) False) id
+      . traceResult False
+      $ trace
+  where
+    experiment :: IOSim s Property
+    experiment = do
+      r <- setMaskingState_ ms $
+             timeout 1 (threadDelay 1 >> atomically (return ()))
+      -- let the assassin run, if it's still alive
+      threadDelay 1
+      return (r === Just ())
+
+
+-- | The timed thread catches the `TimeoutException` of its `timeout`, and
+-- another thread throws it back while the timed thread is masked within the
+-- frame.  The forwarded exception must be raised after the frame is left.
+--
+unit_timeout_forwarded_exception :: Property
+unit_timeout_forwarded_exception = once $
+    let trace = runSimTrace experiment in
+        counterexample (ppTrace_ trace)
+      . either (\e -> counterexample (show e) False) id
+      . traceResult False
+      $ trace
+  where
+    experiment :: IOSim s Property
+    experiment = do
+      tid  <- myThreadId
+      done <- newEmptyTMVarIO
+      r <- try $ mask_ $ do
+        _ <- timeout 1 $ do
+          -- `threadDelay` is interruptible, the timeout fires here
+          r' <- try (threadDelay 2)
+          case r' :: Either SomeException () of
+            Left e   -> void $ forkIO $ throwTo tid e
+                                     >> atomically (putTMVar done ())
+            Right () -> return ()
+          -- let the forked thread block in `throwTo`
+          uninterruptibleMask_ (threadDelay 1)
+        -- an interruptible point: the forwarded exception is raised here
+        atomically (takeTMVar done)
+      -- the forwarding thread finished
+      atomically (takeTMVar done)
+      return $ counterexample (show r)
+             $ isLeft (r :: Either SomeException ())
 
 
 -- | Verify that a thread blocked on `threadDelay` is not unblocked by an STM

@@ -53,7 +53,7 @@ import Data.List qualified as List
 import Data.List.Trace qualified as Trace
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (mapMaybe)
+import Data.Maybe (catMaybes, mapMaybe)
 import Data.Ord
 import Data.Set (Set)
 import Data.Set qualified as Set
@@ -353,20 +353,13 @@ schedule thread@Thread{
           -- as the timeout expired, this will be a race condition. That's why
           -- we have the locks to solve this.
 
-          -- We cannot do `tryPutMVar` in the `treadAction`, because we need to
-          -- know if the `lock` is empty right now when we still have the frame.
-          v <- execTryPutTMVar lock undefined
-          let -- Kill the assassin throwing thread then unmask exceptions and
-              -- carry on the continuation
-              threadAction :: IOSim s ()
-              threadAction =
-                if v then unsafeUnregisterTimeout tmid
-                     else atomically (takeTMVar lock) >>= killThread
-
-              thread' =
+          cleanup <-
+                maybe (unsafeUnregisterTimeout tmid)
+                      killThread
+            <$> closeTimeoutLock (TimeoutLock tmid lock)
+          let thread' =
                 thread { threadControl =
-                          ThreadControl (case threadAction of
-                                          IOSim k' -> k' (\() -> k (Just x)))
+                          ThreadControl (unIOSim cleanup (\() -> k (Just x)))
                                         ctl'
                        }
           schedule thread' simstate
@@ -378,10 +371,23 @@ schedule thread@Thread{
 
       Throw e -> case unwindControlStack e thread timers of
         -- Found a CatchFrame
-        (Right thread0@Thread { threadMasking = maskst' }, timers'') -> do
-          -- We found a suitable exception handler, continue with that
+        (Right thread0@Thread { threadControl = ThreadControl handlerAction handlerCtl
+                              , threadMasking = maskst'
+                              }, timers'', locks) -> do
+          -- We found a suitable exception handler, continue with that,
+          -- but first cleanup any unwind `TimeoutFrame` locks.
           -- We record a step, in case there is no exception handler on replay.
-          let (thread', eff)  = stepThread thread0
+          tids <- traverse closeTimeoutLock locks
+          let -- at least one assassin thread won the race
+              cleanups :: IOSim s ()
+              cleanups = traverse_ killThread (catMaybes tids)
+
+              thread1 = thread0 { threadControl =
+                                    ThreadControl (case cleanups of
+                                                     IOSim k' -> k' (\() -> handlerAction))
+                                                  handlerCtl
+                                }
+              (thread', eff)  = stepThread thread1
               control'        = advanceControl (threadStepId thread0) control
               races'          = updateRaces thread0 simstate
           trace <- schedule thread' simstate{ races = races',
@@ -393,7 +399,7 @@ schedule thread@Thread{
                   SimPORTrace time tid tstep tlbl (EventRaces races')
                   trace)
 
-        (Left isMain, timers'')
+        (Left isMain, timers'', locks)
           -- We unwound and did not find any suitable exception handler, so we
           -- have an unhandled exception at the top level of the thread.
           | isMain -> do
@@ -405,7 +411,11 @@ schedule thread@Thread{
                     TraceMainException time (Labelled tid tlbl) e (labelledThreads threads))
 
           | otherwise -> do
-            -- An unhandled exception in any other thread terminates the thread
+            -- An unhandled exception in any other thread terminates the thread.
+            -- Close the locks.  We don't need to kill the assassins which hold
+            -- them: throwing to a terminated thread is a no-op, and a `throwTo`
+            -- blocked on it is woken up by `deschedule Terminated`.
+            traverse_ closeTimeoutLock locks
             let terminated = Terminated
             !trace <- deschedule terminated thread simstate { timers = timers'' }
             return $ SimPORTrace time tid tstep tlbl (EventThrow e)
@@ -1227,6 +1237,7 @@ forkTimeoutInterruptThreads timeoutExpired simState =
                            threadControl =
                             ThreadControl
                               (runIOSim $ do
+                                 -- assassin thread
                                  mtid <- myThreadId
                                  v2 <- atomically $ tryPutTMVar lock mtid
                                  when v2 $
@@ -1249,6 +1260,32 @@ forkTimeoutInterruptThreads timeoutExpired simState =
               )
 
 
+data TimeoutLock s =
+  TimeoutLock
+    TimeoutId
+    (TMVar (IOSim s) IOSimThreadId)
+
+
+-- | Close the lock of a `TimeoutFrame` in the step which leaves it, and
+-- return the assassin which holds it, if any.
+--
+-- We close the `lock` in `ST`, rather than in an action the thread runs
+-- later: committing a transaction yields, and the assassin could take the
+-- lock, and throw, after the frame is gone.
+--
+closeTimeoutLock
+  :: TimeoutLock s
+  -> ST s (Maybe IOSimThreadId)
+closeTimeoutLock (TimeoutLock _tmid (TMVar lock)) = do
+  v <- execReadTVar lock
+  case v of
+    -- The assassin has not taken the lock: fill it, so that it never will.
+    -- Only the constructor is ever inspected.
+    Nothing  -> execWriteTVar lock (Just undefined)
+             >> pure Nothing
+    Just tid -> pure (Just tid)
+
+
 -- | Iterate through the control stack to find an enclosing exception handler
 -- of the right type, or unwind all the way to the top level for the thread.
 --
@@ -1261,23 +1298,34 @@ unwindControlStack :: forall s a.
                    -> Timeouts s
                    -> ( Either Bool (Thread s a)
                       , Timeouts s
+                      , [TimeoutLock s]
                       )
-unwindControlStack e thread = \timeouts ->
+                   -- ^ a tuple containing:
+                   --
+                   -- * returns cleanly or on `MainFrame` / `ForkFrame`
+                   -- * timers without the timeout in the `TimeoutFrame`
+                   --   corresponding to `e`
+                   -- * timeout locks from all `TimeoutFrame`s which we unwind
+                   --
+unwindControlStack e = \thread timers ->
     case threadControl thread of
-      ThreadControl _ ctl -> unwind (threadMasking thread) ctl timeouts
+      ThreadControl _ ctl ->
+        unwind thread ctl timers []
   where
-    unwind :: forall s' c. MaskingState
+    unwind :: forall s' c.
+              Thread s a
            -> ControlStack s' c a
            -> Timeouts s
-           -> (Either Bool (Thread s' a), Timeouts s)
-    unwind _  MainFrame                 timers = (Left True, timers)
-    unwind _  ForkFrame                 timers = (Left False, timers)
-    unwind _ (MaskFrame _k maskst' ctl) timers = unwind maskst' ctl timers
+           -> [TimeoutLock s']
+           -> (Either Bool (Thread s' a), Timeouts s, [TimeoutLock s'])
+    unwind _  MainFrame                 timers locks = (Left True, timers, reverse locks)
+    unwind _  ForkFrame                 timers locks = (Left False, timers, reverse locks)
+    unwind thread (MaskFrame _k maskst' ctl) timers locks = unwind thread { threadMasking = maskst' } ctl timers locks
 
-    unwind maskst (CatchFrame handler k ctl) timers =
+    unwind thread (CatchFrame handler k ctl) timers locks =
       case fromException e of
         -- not the right type, unwind to the next containing handler
-        Nothing -> unwind maskst ctl timers
+        Nothing -> unwind thread ctl timers locks
 
         -- Ok! We will be able to continue the thread with the handler
         -- followed by the continuation after the catch
@@ -1285,10 +1333,11 @@ unwindControlStack e thread = \timeouts ->
                           -- As per async exception rules, the handler is run
                           -- masked
                          threadControl = ThreadControl (handler e')
-                                                       (MaskFrame k maskst ctl),
-                         threadMasking = atLeastInterruptibleMask maskst
+                                                       (MaskFrame k (threadMasking thread) ctl),
+                         threadMasking = atLeastInterruptibleMask (threadMasking thread)
                        }
                    , timers
+                   , reverse locks
                    )
 
     -- Either Timeout fired or the action threw an exception.
@@ -1296,19 +1345,23 @@ unwindControlStack e thread = \timeouts ->
     --   so we need to run the continuation with a Nothing value.
     -- - If the timeout action threw an exception we need to keep unwinding the
     --   control stack looking for a handler to this exception.
-    unwind maskst (TimeoutFrame tmid isLockedRef k ctl) timers =
+    unwind thread (TimeoutFrame tmid lock k ctl) timers locks =
         case fromException e of
           -- Exception came from timeout expiring
           Just (TimeoutException tmid')  | tmid == tmid' ->
-            (Right thread { threadControl = ThreadControl (k Nothing) ctl }, timers')
-            -- Exception came from a different exception
-          _ -> unwind maskst ctl timers'
+            (Right thread { threadControl = ThreadControl (k Nothing) ctl }, timers', reverse locks)
+            -- Exception came from a different exception.  The cleanup of the
+            -- lock kills the assassin, if any.
+          _ -> unwind thread
+                      ctl
+                      timers'
+                      (TimeoutLock tmid lock : locks)
       where
         -- Remove the timeout associated with the 'TimeoutFrame'.
         timers' = IPSQ.delete (coerce tmid) timers
 
-    unwind maskst (DelayFrame tmid _k ctl) timers =
-        unwind maskst ctl timers'
+    unwind thread (DelayFrame tmid _k ctl) timers locks =
+        unwind thread ctl timers' locks
       where
         -- Remove the timeout associated with the 'DelayFrame'.
         timers' = IPSQ.delete (coerce tmid) timers
@@ -1605,15 +1658,6 @@ execNewTVar !tvarId !mbLabel x = do
 execWriteTVar :: TVar s a -> a -> ST s ()
 execWriteTVar TVar{tvarCurrent} = writeSTRef tvarCurrent
 {-# INLINE execWriteTVar #-}
-
-execTryPutTMVar :: TMVar (IOSim s) a -> a -> ST s Bool
-execTryPutTMVar (TMVar var) a = do
-    v <- execReadTVar var
-    case v of
-      Nothing -> execWriteTVar var (Just a)
-              >> return True
-      Just _  -> return False
-{-# INLINE execTryPutTMVar #-}
 
 saveTVar :: TVar s a -> ST s ()
 saveTVar TVar{tvarCurrent, tvarUndo} = do

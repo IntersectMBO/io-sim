@@ -1,5 +1,20 @@
 # Revision history of io-sim
 
+## next version
+
+### Breaking changes
+
+* `IOSimPOR`: some threads take a different number of steps, e.g. when
+  a `timeout` action finishes after the timeout fired (#269).  Replaying
+  a `ScheduleControl` recorded with an earlier version might fail with
+  "Thread step out of sync", or might not reproduce the same schedule.
+
+### Non-breaking changes
+
+* Fixed `timeout` in `IOSim` and `IOSimPOR`: if the action finished when the
+  timeout fired, the timeout exception could be raised after `timeout`
+  returned (#269).
+
 ## 1.11.0.0
 
 ### Breaking changes

@@ -12,6 +12,7 @@ import Data.Foldable (traverse_)
 #else
 import Data.Foldable (foldl', traverse_)
 #endif
+import Data.Either (isLeft)
 import Data.Functor (($>))
 import Data.List qualified as List
 import Data.Map (Map)
@@ -77,6 +78,8 @@ tests =
       , testProperty "timeouts"               prop_timeouts
       , testProperty "stacked timeouts"       prop_stacked_timeouts
       , testProperty "{register,thread}Delay" unit_registerDelay_threadDelay
+      , testProperty "forwarded timeout exception"
+                                              unit_timeout_forwarded_exception
       ]
     , testProperty "infinite simulation"      prop_explore_endless_simulation
     , testProperty "threadId order (IOSim)"   (withNumTests 1000 prop_threadId_order_order_Sim)
@@ -1148,6 +1151,55 @@ unit_timeouts_and_async_exceptions_3 =
       killThread tid
       threadDelay 1
       return $ property True
+
+
+-- | Similar to `ioProperty`, but explores races with `IOSimPOR`.
+-- `exploreRaces` is enabled at the start of the `IOSim s` property.
+--
+ioSimPORProperty
+  :: Testable property
+  => Bool
+  -- ^ if True the property will fail if there are any threads which
+  -- didn't terminate when the main thread terminated.
+  -> (forall s. IOSim s property)
+  -> Property
+ioSimPORProperty strict iosim =
+    exploreSimTrace id (exploreRaces >> iosim) $ \_ trace ->
+        counterexample (ppTrace_ trace)
+      . either (\e -> counterexample (show e) False)
+               property
+      . traceResult strict
+      $ trace
+
+
+-- | The timed thread catches the `TimeoutException` of its `timeout`, and
+-- another thread throws it back while the timed thread is masked within the
+-- frame.  The forwarded exception must be raised after the frame is left.
+--
+unit_timeout_forwarded_exception :: Property
+unit_timeout_forwarded_exception =
+    ioSimPORProperty False experiment
+  where
+    experiment :: IOSim s Property
+    experiment = do
+      tid  <- myThreadId
+      done <- newEmptyTMVarIO
+      r <- try $ mask_ $ do
+        _ <- timeout 1 $ do
+          -- `threadDelay` is interruptible, the timeout fires here
+          r' <- try (threadDelay 2)
+          case r' :: Either SomeException () of
+            Left e   -> void $ forkIO $ throwTo tid e
+                                     >> atomically (putTMVar done ())
+            Right () -> return ()
+          -- let the forked thread block in `throwTo`
+          uninterruptibleMask_ (threadDelay 1)
+        -- an interruptible point: the forwarded exception is raised here
+        atomically (takeTMVar done)
+      -- the forwarding thread finished
+      atomically (takeTMVar done)
+      return $ counterexample (show r)
+             $ isLeft (r :: Either SomeException ())
 
 --
 -- MonadMask properties
