@@ -77,6 +77,10 @@ tests =
       , testProperty "timeouts"               prop_timeouts
       , testProperty "stacked timeouts"       prop_stacked_timeouts
       , testProperty "{register,thread}Delay" unit_registerDelay_threadDelay
+      , testProperty "assassin: pending throw"
+      $ forall_masking_states unit_timeout_assassin_pending_throw
+      , testProperty "assassin: holds the lock"
+      $ forall_masking_states unit_timeout_assassin_holds_lock
       ]
     , testProperty "infinite simulation"      prop_explore_endless_simulation
     , testProperty "threadId order (IOSim)"   (withNumTests 1000 prop_threadId_order_order_Sim)
@@ -1148,6 +1152,58 @@ unit_timeouts_and_async_exceptions_3 =
       killThread tid
       threadDelay 1
       return $ property True
+
+
+-- | The assassin of a `timeout` throws while the timed thread is masked and
+-- runnable, so its exception is pending when the action finishes.  It must
+-- not be raised after `timeout` returns (#269).
+--
+-- `timeout` runs in a forked thread, so that the steps of its assassin are
+-- racy as well.
+--
+unit_timeout_assassin_pending_throw :: MaskingState -> Property
+unit_timeout_assassin_pending_throw ms =
+    exploreSimTrace id experiment $ \_ trace ->
+        counterexample (ppTrace_ trace)
+      . either (\e -> counterexample (show e) False) id
+      . traceResult False
+      $ trace
+  where
+    experiment :: IOSim s Property
+    experiment = do
+      exploreRaces
+      flag <- newTVarIO False
+      _ <- forkIO $ threadDelay 1 >> atomically (writeTVar flag True)
+      r <- waitCatch =<< async (setMaskingState_ ms $
+             timeout 1 (atomically (readTVar flag >>= check)))
+      return $ case r of
+        Left e  -> counterexample (show e) False
+        Right _ -> property True
+
+
+-- | The assassin of a `timeout` takes the lock, but the action finishes
+-- before it throws.  The exception must not be raised after `timeout`
+-- returns (#269).
+--
+-- `timeout` runs in a forked thread, so that the steps of its assassin are
+-- racy as well.
+--
+unit_timeout_assassin_holds_lock :: MaskingState -> Property
+unit_timeout_assassin_holds_lock ms =
+    exploreSimTrace id experiment $ \_ trace ->
+        counterexample (ppTrace_ trace)
+      . either (\e -> counterexample (show e) False) id
+      . traceResult False
+      $ trace
+  where
+    experiment :: IOSim s Property
+    experiment = do
+      exploreRaces
+      r <- waitCatch =<< async (setMaskingState_ ms $
+             timeout 1 (threadDelay 1 >> atomically (return ())))
+      return $ case r of
+        Left e  -> counterexample (show e) False
+        Right _ -> property True
 
 --
 -- MonadMask properties

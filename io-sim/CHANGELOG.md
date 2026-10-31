@@ -1,5 +1,13 @@
 # Revision history of io-sim
 
+## next version
+
+### Non-breaking changes
+
+* Fixed `timeout` in `IOSim` and `IOSimPOR`: if the action finished when the
+  timeout fired, the timeout exception could be raised after `timeout`
+  returned (#269).
+
 ## 1.11.0.0
 
 ### Breaking changes

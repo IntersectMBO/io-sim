@@ -356,18 +356,31 @@ schedule thread@Thread{
           -- We cannot do `tryPutMVar` in the `treadAction`, because we need to
           -- know if the `lock` is empty right now when we still have the frame.
           v <- execTryPutTMVar lock undefined
-          let -- Kill the assassin throwing thread then unmask exceptions and
-              -- carry on the continuation
-              threadAction :: IOSim s ()
-              threadAction =
-                if v then unsafeUnregisterTimeout tmid
-                     else atomically (takeTMVar lock) >>= killThread
-
-              thread' =
+          -- Either unregister the timeout, or kill the assassin throwing
+          -- thread, then carry on the continuation.
+          --
+          -- If the assassin holds the lock, we take it here rather than with
+          -- `atomically` in the `threadAction`: committing a transaction
+          -- yields, and the assassin could throw before we kill it, after the
+          -- frame is gone.  `killThread` does not yield before the exception
+          -- is delivered, and the assassin is unmasked, so it never blocks.
+          threadAction :: IOSim s () <-
+            if v then return (unsafeUnregisterTimeout tmid)
+                 else killThread <$> execTakeTMVar lock
+          let thread' =
                 thread { threadControl =
                           ThreadControl (case threadAction of
                                           IOSim k' -> k' (\() -> k (Just x)))
                                         ctl'
+                         -- If the assassin has already thrown, but we were not
+                         -- interruptible, its exception is pending.  Killing
+                         -- the assassin does not retract it (unlike in GHC's
+                         -- RTS), so we drop it here: otherwise it would be
+                         -- raised outside of the frame.
+                       , threadThrowTo =
+                           filter (\(e, _, _) -> fromException e
+                                              /= Just (TimeoutException tmid))
+                                  (threadThrowTo thread)
                        }
           schedule thread' simstate
 
@@ -638,74 +651,73 @@ schedule thread@Thread{
                $ SimPORTrace time tid tstep tlbl (EventDeschedule Yield)
                $ trace
 
-      Atomically a k -> execAtomically time tid tlbl nextVid (runSTM a) $ \res ->
-        case res of
-          StmTxCommitted x written read created
-                           tvarDynamicTraces tvarStringTraces nextVid' -> do
-            (wakeup, wokeby) <- threadsUnblockedByWrites written
-            mapM_ (\(SomeTVar tvar) -> unblockAllThreadsFromTVar tvar) written
-            vClockRead <- leastUpperBoundTVarVClocks read
-            read' <- mapM someTVarToLabelled read
-            written' <- mapM someTVarToLabelled written
-            let vClock'     = vClock `leastUpperBoundVClock` vClockRead
-                effect'     = effect
-                           <> readEffects read'
-                           <> writeEffects written'
-                           <> wakeupEffects unblocked
-                thread'     = thread { threadControl = ThreadControl (k x) ctl,
-                                       threadVClock  = vClock',
-                                       threadEffect  = effect' }
-                (unblocked,
-                 simstate') = unblockThreads True vClock' wakeup simstate
-            sequence_ [ modifySTRef (tvarVClock r) (leastUpperBoundVClock vClock')
-                      | SomeTVar r <- created ++ written ]
-            written'' <- traverse (\(SomeTVar tvar) -> labelledTVarId tvar) written
-            created' <- traverse (\(SomeTVar tvar) -> labelledTVarId tvar) created
-            -- We deschedule a thread after a transaction... another may have woken up.
-            !trace <- deschedule Yield thread' simstate' { nextVid  = nextVid' }
-            return $
-              SimPORTrace time tid tstep tlbl (EventTxCommitted written'' created' (Just effect')) $
-              traceMany
-                [ (time, tid', (-1), tlbl', EventTxWakeup vids')
-                | tid' <- unblocked
-                , let tlbl' = lookupThreadLabel tid' threads
-                , let Just vids' = Set.toList <$> Map.lookup tid' wokeby ] $
-              traceMany
-                [ (time, tid, tstep, tlbl, EventLog tr)
-                | tr <- tvarDynamicTraces
-                ] $
-              traceMany
-                [ (time, tid, tstep, tlbl, EventSay str)
-                | str <- tvarStringTraces
-                ] $
-              SimPORTrace time tid tstep tlbl (EventUnblocked unblocked) $
-              SimPORTrace time tid tstep tlbl (EventDeschedule Yield) $
-                trace
+      Atomically a k -> execAtomically time tid tlbl nextVid (runSTM a) $ \case
+        StmTxCommitted x written read created
+                         tvarDynamicTraces tvarStringTraces nextVid' -> do
+          (wakeup, wokeby) <- threadsUnblockedByWrites written
+          mapM_ (\(SomeTVar tvar) -> unblockAllThreadsFromTVar tvar) written
+          vClockRead <- leastUpperBoundTVarVClocks read
+          read' <- mapM someTVarToLabelled read
+          written' <- mapM someTVarToLabelled written
+          let vClock'     = vClock `leastUpperBoundVClock` vClockRead
+              effect'     = effect
+                         <> readEffects read'
+                         <> writeEffects written'
+                         <> wakeupEffects unblocked
+              thread'     = thread { threadControl = ThreadControl (k x) ctl,
+                                     threadVClock  = vClock',
+                                     threadEffect  = effect' }
+              (unblocked,
+               simstate') = unblockThreads True vClock' wakeup simstate
+          sequence_ [ modifySTRef (tvarVClock r) (leastUpperBoundVClock vClock')
+                    | SomeTVar r <- created ++ written ]
+          written'' <- traverse (\(SomeTVar tvar) -> labelledTVarId tvar) written
+          created' <- traverse (\(SomeTVar tvar) -> labelledTVarId tvar) created
+          -- We deschedule a thread after a transaction... another may have woken up.
+          !trace <- deschedule Yield thread' simstate' { nextVid  = nextVid' }
+          return $
+            SimPORTrace time tid tstep tlbl (EventTxCommitted written'' created' (Just effect')) $
+            traceMany
+              [ (time, tid', (-1), tlbl', EventTxWakeup vids')
+              | tid' <- unblocked
+              , let tlbl' = lookupThreadLabel tid' threads
+              , let Just vids' = Set.toList <$> Map.lookup tid' wokeby ] $
+            traceMany
+              [ (time, tid, tstep, tlbl, EventLog tr)
+              | tr <- tvarDynamicTraces
+              ] $
+            traceMany
+              [ (time, tid, tstep, tlbl, EventSay str)
+              | str <- tvarStringTraces
+              ] $
+            SimPORTrace time tid tstep tlbl (EventUnblocked unblocked) $
+            SimPORTrace time tid tstep tlbl (EventDeschedule Yield) $
+              trace
 
-          StmTxAborted read e -> do
-            -- schedule this thread to immediately raise the exception
-            vClockRead <- leastUpperBoundTVarVClocks read
-            read' <- mapM someTVarToLabelled read
-            let effect' = effect <> readEffects read'
-                thread' = thread { threadControl = ThreadControl (Throw e) ctl,
-                                   threadVClock  = vClock `leastUpperBoundVClock` vClockRead,
-                                   threadEffect  = effect' }
-            trace <- schedule thread' simstate
-            return $ SimPORTrace time tid tstep tlbl (EventTxAborted (Just effect'))
-                   $ trace
+        StmTxAborted read e -> do
+          -- schedule this thread to immediately raise the exception
+          vClockRead <- leastUpperBoundTVarVClocks read
+          read' <- mapM someTVarToLabelled read
+          let effect' = effect <> readEffects read'
+              thread' = thread { threadControl = ThreadControl (Throw e) ctl,
+                                 threadVClock  = vClock `leastUpperBoundVClock` vClockRead,
+                                 threadEffect  = effect' }
+          trace <- schedule thread' simstate
+          return $ SimPORTrace time tid tstep tlbl (EventTxAborted (Just effect'))
+                 $ trace
 
-          StmTxBlocked read -> do
-            mapM_ (\(SomeTVar tvar) -> blockThreadOnTVar tid tvar) read
-            vids <- traverse (\(SomeTVar tvar) -> labelledTVarId tvar) read
-            vClockRead <- leastUpperBoundTVarVClocks read
-            read' <- mapM someTVarToLabelled read
-            let effect' = effect <> readEffects read'
-                thread' = thread { threadVClock  = vClock `leastUpperBoundVClock` vClockRead,
-                                   threadEffect  = effect' }
-            !trace <- deschedule (Blocked BlockedOnSTM) thread' simstate
-            return $ SimPORTrace time tid tstep tlbl (EventTxBlocked vids (Just effect'))
-                   $ SimPORTrace time tid tstep tlbl (EventDeschedule (Blocked BlockedOnSTM))
-                   $ trace
+        StmTxBlocked read -> do
+          mapM_ (\(SomeTVar tvar) -> blockThreadOnTVar tid tvar) read
+          vids <- traverse (\(SomeTVar tvar) -> labelledTVarId tvar) read
+          vClockRead <- leastUpperBoundTVarVClocks read
+          read' <- mapM someTVarToLabelled read
+          let effect' = effect <> readEffects read'
+              thread' = thread { threadVClock  = vClock `leastUpperBoundVClock` vClockRead,
+                                 threadEffect  = effect' }
+          !trace <- deschedule (Blocked BlockedOnSTM) thread' simstate
+          return $ SimPORTrace time tid tstep tlbl (EventTxBlocked vids (Just effect'))
+                 $ SimPORTrace time tid tstep tlbl (EventDeschedule (Blocked BlockedOnSTM))
+                 $ trace
 
       GetThreadId k -> do
         let thread' = thread { threadControl = ThreadControl (k tid) ctl }
@@ -1228,6 +1240,7 @@ forkTimeoutInterruptThreads timeoutExpired simState =
                            threadControl =
                             ThreadControl
                               (runIOSim $ do
+                                 -- assassin thread
                                  mtid <- myThreadId
                                  v2 <- atomically $ tryPutTMVar lock mtid
                                  when v2 $
@@ -1615,6 +1628,15 @@ execTryPutTMVar (TMVar var) a = do
               >> return True
       Just _  -> return False
 {-# INLINE execTryPutTMVar #-}
+
+execTakeTMVar :: TMVar (IOSim s) a -> ST s a
+execTakeTMVar (TMVar var) = do
+    v <- execReadTVar var
+    case v of
+      Just a  -> execWriteTVar var Nothing
+              >> return a
+      Nothing -> error "execTakeTMVar: empty TMVar"
+{-# INLINE execTakeTMVar #-}
 
 saveTVar :: TVar s a -> ST s ()
 saveTVar TVar{tvarCurrent, tvarUndo} = do
