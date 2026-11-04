@@ -74,6 +74,8 @@ tests =
     , testProperty "strict shutdown"        unit_timeout_strict_shutdown
     , testProperty "fired, then returned"   unit_timeout_fired_then_returned
     , testProperty "fired, then unwound"    unit_timeout_fired_then_unwound
+    , testProperty "queued, then unwound"
+    $ forall_masking_states unit_timeout_queued_then_unwound
     , testProperty "nested: outer fires after inner"
                                             unit_timeout_nested_outer_fires
     , testProperty "threadDelay and STM"    unit_threadDelay_and_stm
@@ -1331,6 +1333,30 @@ unit_timeout_fired_then_unwound = once $
       yield
       threadDelay 1
       return (r === (Left DivideByZero :: Either ArithException (Maybe ())))
+
+
+-- | The `timeout` fires when the timed thread is about to throw, and the
+-- exception unwinds through the `TimeoutFrame`.  If the thread is masked, the
+-- `TimeoutException` is pending and must be dropped with the frame, otherwise
+-- it would be raised when the thread unmasks.
+--
+unit_timeout_queued_then_unwound :: MaskingState -> Property
+unit_timeout_queued_then_unwound ms = once $
+    let trace = runSimTrace experiment in
+        counterexample (ppTrace_ trace)
+      . either (\e -> counterexample (show e) False) id
+      . traceResult True
+      $ trace
+  where
+    experiment :: IOSim s Property
+    experiment = do
+      r <- try $ setMaskingState_ ms $
+             timeout 1 (threadDelay 1 >> atomically (pure ()) >> throwIO DivideByZero)
+      -- an interruptible point, a pending exception would be raised here
+      threadDelay 1
+      return $ (r :: Either ArithException (Maybe ())) === case ms of
+        Unmasked -> Right Nothing
+        _        -> Left DivideByZero
 
 
 -- | Nested `timeout`s fire at the same time: the inner one is delivered first.
