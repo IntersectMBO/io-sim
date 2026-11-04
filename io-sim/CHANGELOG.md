@@ -7,17 +7,24 @@
 * Fixed `timeout` in `IOSim` and `IOSimPOR`: if the action finished when the
   timeout fired, the timeout exception could be raised after `timeout`
   returned (#269).
-* `timeout` in `IOSim` no longer forks a thread to throw the timeout
-  exception: the scheduler delivers it, after every thread runnable when the
-  timeout fired has run.  `timeout` no longer leaves a thread behind, which
-  made `runSimStrictShutdown` fail with `FailureSloppyShutdown` when the
-  action finished at the deadline.  The trace no longer contains
-  `EventThreadForked` for a fired timeout, but `EventThrowTo` from the
-  `ThreadId [-1]` "timeout timer" pseudo-thread.  An action which finishes at
-  the deadline still wins, unless it yields after the deadline before it
-  finishes (e.g. on `atomically`).  If nested timeouts fire at the same time,
-  the inner one is delivered first.  `timeout` no longer allocates a lock
-  `TVar`, so `TVarId`s in traces after a `timeout` change.
+* `timeout` in `IOSim` and `IOSimPOR` no longer forks a thread to throw the
+  timeout exception: the scheduler delivers it.  `timeout` no longer leaves a
+  thread behind, which made `runSimStrictShutdown` fail with
+  `FailureSloppyShutdown` when the action finished at the deadline.
+  * The trace no longer contains `EventThreadForked` for a fired timeout, but
+    `EventThrowTo` from the `ThreadId [-1]` "timeout timer" pseudo-thread.
+  * `timeout` no longer allocates a lock `TVar`, so `TVarId`s in traces after
+    a `timeout` change.  In `IOSimPOR`, it no longer forks a child of the
+    timed thread, so the ids of threads it forks afterwards change.
+  * In `IOSim`, the exception is delivered after every thread runnable when
+    the timeout fired has run.  An action which finishes at the deadline still
+    wins, unless it yields after the deadline before it finishes (e.g. on
+    `atomically`).
+  * In `IOSimPOR`, the exception is delivered when the timeout fires: as
+    before, the timeout wins a tie.  The delivery is not a step, so it does
+    not race with the steps of the action.
+  * If nested timeouts fire at the same time, the inner one is delivered
+    first; the outer one still fires if its action carries on.
 
 ## 1.11.0.0
 

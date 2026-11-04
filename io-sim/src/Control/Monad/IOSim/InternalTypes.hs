@@ -5,18 +5,12 @@
 module Control.Monad.IOSim.InternalTypes
   ( ThreadControl (..)
   , ControlStack (..)
-  , IsLocked (..)
-  , unsafeUnregisterTimeout
   ) where
 
-import Control.Concurrent.Class.MonadSTM
 import Control.Exception (Exception)
 import Control.Monad.Class.MonadThrow (MaskingState (..))
 
-import Control.Monad.IOSim.Types (IOSim (..), IOSimThreadId, SimA (..),
-           TimeoutId)
-
-import GHC.Exts (oneShot)
+import Control.Monad.IOSim.Types (SimA (..), TimeoutId)
 
 -- We hide the type @b@ here, so it's useful to bundle these two parts together,
 -- rather than having Thread have an existential type, which makes record
@@ -42,7 +36,6 @@ data ControlStack s b a where
              -> !(ControlStack s c a)
              -> ControlStack s b a
   TimeoutFrame :: TimeoutId
-               -> TMVar (IOSim s) IOSimThreadId
                -> (Maybe b -> SimA s c)
                -> !(ControlStack s c a)
                -> ControlStack s b a
@@ -59,7 +52,7 @@ instance Show (ControlStack s b a) where
       dash ForkFrame                  = ForkFrame'
       dash (MaskFrame _ m cs)         = MaskFrame' m (dash cs)
       dash (CatchFrame _ _ cs)        = CatchFrame' (dash cs)
-      dash (TimeoutFrame tmid _ _ cs) = TimeoutFrame' tmid (dash cs)
+      dash (TimeoutFrame tmid _ cs)   = TimeoutFrame' tmid (dash cs)
       dash (DelayFrame tmid _ cs)     = DelayFrame' tmid (dash cs)
 
 data ControlStackDash =
@@ -67,24 +60,7 @@ data ControlStackDash =
   | ForkFrame'
   | MaskFrame' MaskingState ControlStackDash
   | CatchFrame' ControlStackDash
-  -- TODO: Figure out a better way to include IsLocked here
   | TimeoutFrame' TimeoutId ControlStackDash
   | ThreadDelayFrame' TimeoutId ControlStackDash
   | DelayFrame' TimeoutId ControlStackDash
   deriving Show
-
-data IsLocked = NotLocked | Locked !IOSimThreadId
-  deriving (Eq, Show)
-
--- | Unsafe method which removes a timeout.
---
--- It's not part of public API, and it might cause deadlocks when used in
--- a wrong context.
---
--- It is defined here rather so that it's not exposed to the user, even tough
--- one could define it oneself.
---
--- TODO: `SimA` constructors should be defined here.
---
-unsafeUnregisterTimeout :: TimeoutId -> IOSim s ()
-unsafeUnregisterTimeout tmid = IOSim $ oneShot $ \k -> UnregisterTimeout tmid (k ())

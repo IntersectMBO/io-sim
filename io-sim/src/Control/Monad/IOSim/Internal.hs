@@ -63,7 +63,6 @@ import Control.Monad.ST.Lazy
 import Control.Monad.ST.Lazy.Unsafe (unsafeIOToST, unsafeInterleaveST)
 import Data.STRef.Lazy
 
-import Control.Concurrent.Class.MonadSTM.TMVar
 import Control.Concurrent.Class.MonadSTM.TVar hiding (TVar)
 import Control.Monad.Class.MonadSTM hiding (STM)
 import Control.Monad.Class.MonadThrow hiding (getMaskingState)
@@ -241,7 +240,7 @@ schedule !thread@Thread{
         let thread' = thread { threadControl = ThreadControl (k x) ctl' }
         schedule thread' simstate
 
-      TimeoutFrame tmid _lock k ctl' -> do
+      TimeoutFrame tmid k ctl' -> do
         -- The action finished first.  Remove the timeout: its timer if it has
         -- not fired yet, its undelivered exception if it has fired, or its
         -- pending exception if it was delivered but this thread was not
@@ -366,7 +365,7 @@ schedule !thread@Thread{
           !timers'   = (PSQ.insert . coerce) nextTmid expiry (TimerTimeout tid nextTmid) timers
           !thread'   = thread { threadControl =
                                  ThreadControl action'
-                                               (TimeoutFrame nextTmid noTimeoutLock k ctl)
+                                               (TimeoutFrame nextTmid k ctl)
                               }
       !trace <- deschedule Yield thread' simstate { timers   = timers'
                                                   , nextTmid = succ nextTmid
@@ -963,12 +962,6 @@ dropTimeoutException :: TimeoutId
 dropTimeoutException tmid =
     filter (\(e, _) -> fromException e /= Just (TimeoutException tmid))
 
--- | 'IOSim' does not use the lock of a 'TimeoutFrame' (only 'IOSimPOR' does).
---
-noTimeoutLock :: TMVar (IOSim s) IOSimThreadId
-noTimeoutLock = error "IOSim: internal error: TimeoutFrame lock is not used"
-
-
 -- | Iterate through the control stack to find an enclosing exception handler
 -- of the right type, or unwind all the way to the top level for the thread.
 --
@@ -1033,7 +1026,7 @@ unwindControlStack e = \thread timers fired ->
     --   so we need to run the continuation with a Nothing value.
     -- - If the timeout action threw an exception we need to keep unwinding the
     --   control stack looking for a handler to this exception.
-    unwind thread (TimeoutFrame tmid _lock k ctl) timers fired =
+    unwind thread (TimeoutFrame tmid k ctl) timers fired =
         case fromException e of
           -- Exception came from timeout expiring
           Just (TimeoutException tmid') | tmid == tmid' ->
