@@ -67,10 +67,15 @@ tests =
     , testProperty "async exceptions 1"     unit_timeouts_and_async_exceptions_1
     , testProperty "async exceptions 2"     unit_timeouts_and_async_exceptions_2
     , testProperty "async exceptions 3"     unit_timeouts_and_async_exceptions_3
-    , testProperty "assassin: pending throw"
-    $ forall_masking_states unit_timeout_assassin_pending_throw
-    , testProperty "assassin: holds the lock"
-    $ forall_masking_states unit_timeout_assassin_holds_lock
+    , testProperty "pending throw"
+    $ forall_masking_states unit_timeout_pending_throw
+    , testProperty "yield after the deadline"
+    $ forall_masking_states unit_timeout_yield_after_deadline
+    , testProperty "strict shutdown"        unit_timeout_strict_shutdown
+    , testProperty "fired, then returned"   unit_timeout_fired_then_returned
+    , testProperty "fired, then unwound"    unit_timeout_fired_then_unwound
+    , testProperty "nested: outer fires after inner"
+                                            unit_timeout_nested_outer_fires
     , testProperty "threadDelay and STM"    unit_threadDelay_and_stm
     , testProperty "{register,thread}Delay" unit_registerDelay_threadDelay
     , testProperty "throwTo and STM"        unit_throwTo_and_stm
@@ -1190,16 +1195,16 @@ unit_timeouts_and_async_exceptions_3 = once $
       return $ property True
 
 
--- | The assassin of a `timeout` throws while the timed thread is masked and
--- runnable, so its exception is pending when the action finishes.  It must
--- not be raised after `timeout` returns (#269).
+-- | The `timeout` fires while the timed thread is masked and runnable, so
+-- its exception is pending when the action finishes.  It must not be raised
+-- after `timeout` returns (#269).
 --
 -- The flag is set when the timeout fires.  The writer runs first (woken by its
--- timer), then the assassin (forked at the same time, queued after it), then
--- the timed thread (woken by the write).
+-- timer), then the timeout is delivered, then the timed thread runs (woken by
+-- the write).
 --
-unit_timeout_assassin_pending_throw :: MaskingState -> Property
-unit_timeout_assassin_pending_throw ms = once $
+unit_timeout_pending_throw :: MaskingState -> Property
+unit_timeout_pending_throw ms = once $
     let trace = runSimTrace experiment in
         counterexample (ppTrace_ trace)
       . either (\e -> counterexample (show e) False) id
@@ -1219,29 +1224,132 @@ unit_timeout_assassin_pending_throw ms = once $
         _        -> r === Just ()
 
 
--- | The assassin of a `timeout` takes the lock, but the action finishes
--- before it throws.  The exception must not be raised after `timeout`
--- returns (#269).
+-- | The timed thread is woken by its `threadDelay` timer at the deadline, and
+-- yields once more (on `atomically`) before it finishes.  The `timeout` is
+-- delivered in between: it interrupts the action if the thread is unmasked;
+-- otherwise it is pending, and must not be raised after `timeout` returns
+-- (#269).
 --
--- The timed thread is woken by its `threadDelay` timer before the assassin is
--- forked, and yields once more (on `atomically`) before it finishes.  The
--- assassin takes the lock in between.
---
-unit_timeout_assassin_holds_lock :: MaskingState -> Property
-unit_timeout_assassin_holds_lock ms = once $
+unit_timeout_yield_after_deadline :: MaskingState -> Property
+unit_timeout_yield_after_deadline ms = once $
     let trace = runSimTrace experiment in
         counterexample (ppTrace_ trace)
       . either (\e -> counterexample (show e) False) id
-      . traceResult False
+      . traceResult True
       $ trace
   where
     experiment :: IOSim s Property
     experiment = do
-      r <- setMaskingState_ ms $
-             timeout 1 (threadDelay 1 >> atomically (return ()))
-      -- let the assassin run, if it's still alive
-      threadDelay 1
+      r <- setMaskingState_ ms $ do
+             r <- timeout 1 (threadDelay 1 >> atomically (return ()))
+             -- an interruptible operation, a pending exception would be
+             -- raised here
+             threadDelay 1
+             return r
+      return $ case ms of
+        Unmasked -> r === Nothing
+        _        -> r === Just ()
+
+
+-- | `timeout` must not leave any thread behind, whether the action or the
+-- timeout wins, in particular when the action finishes at the deadline.
+--
+unit_timeout_strict_shutdown :: Property
+unit_timeout_strict_shutdown = once . conjoin $
+    [ check_ "timer never fires"
+             (timeout 1 (threadDelay 0.5))
+             (Just ())
+    , check_ "timeout wins"
+             (timeout 1 (threadDelay 2))
+             Nothing
+    , check_ "tie, action finishes first"
+             (timeout 1 (threadDelay 1))
+             (Just ())
+    , check_ "tie, action finishes first, then yield"
+             (timeout 1 (threadDelay 1) <* yield)
+             (Just ())
+    , check_ "tie, action yields before it finishes"
+             (timeout 1 (threadDelay 1 >> atomically (pure ())))
+             Nothing
+    , check_ "tie, action yields before it finishes, then yield"
+             (timeout 1 (threadDelay 1 >> atomically (pure ())) <* yield)
+             Nothing
+    ]
+  where
+    check_ :: String
+           -> (forall s. IOSim s (Maybe ()))
+           -> Maybe ()
+           -> Property
+    check_ name experiment expected =
+      let trace = runSimTrace experiment in
+          counterexample name
+        . counterexample (ppTrace_ trace)
+        $ case traceResult True trace of
+            Left e  -> counterexample (show e) False
+            Right r -> r === expected
+
+
+-- | A forked thread whose action finishes at the deadline carries on after
+-- `timeout` returns, yields and blocks: the fired `timeout` must not be
+-- delivered to it.
+--
+unit_timeout_fired_then_returned :: Property
+unit_timeout_fired_then_returned = once $
+    let trace = runSimTrace experiment in
+        counterexample (ppTrace_ trace)
+      . either (\e -> counterexample (show e) False) id
+      . traceResult True
+      $ trace
+  where
+    experiment :: IOSim s Property
+    experiment = do
+      v <- newEmptyTMVarIO
+      _ <- forkIO $ do
+        r <- timeout 1 (threadDelay 1)
+        yield
+        threadDelay 1
+        atomically (putTMVar v r)
+      r <- atomically (takeTMVar v)
       return (r === Just ())
+
+
+-- | The action throws at the deadline, before the `timeout` is delivered, and
+-- the exception is caught outside of `timeout`: the fired `timeout` must not
+-- be delivered.
+--
+unit_timeout_fired_then_unwound :: Property
+unit_timeout_fired_then_unwound = once $
+    let trace = runSimTrace experiment in
+        counterexample (ppTrace_ trace)
+      . either (\e -> counterexample (show e) False) id
+      . traceResult True
+      $ trace
+  where
+    experiment :: IOSim s Property
+    experiment = do
+      r <- try (timeout 1 (threadDelay 1 >> throwIO DivideByZero))
+      yield
+      threadDelay 1
+      return (r === (Left DivideByZero :: Either ArithException (Maybe ())))
+
+
+-- | Nested `timeout`s fire at the same time: the inner one is delivered first.
+-- The outer one must still interrupt the action, which carries on after the
+-- inner `timeout` returns.
+--
+unit_timeout_nested_outer_fires :: Property
+unit_timeout_nested_outer_fires = once $
+    let trace = runSimTrace experiment in
+        counterexample (ppTrace_ trace)
+      . either (\e -> counterexample (show e) False) id
+      . traceResult True
+      $ trace
+  where
+    experiment :: IOSim s Property
+    experiment = do
+      r <- timeout 1 (timeout 1 (threadDelay 2) >> threadDelay 5)
+      t <- getMonotonicTime
+      return (r === Nothing .&&. t === Time 1)
 
 
 -- | Verify that a thread blocked on `threadDelay` is not unblocked by an STM

@@ -7,6 +7,17 @@
 * Fixed `timeout` in `IOSim` and `IOSimPOR`: if the action finished when the
   timeout fired, the timeout exception could be raised after `timeout`
   returned (#269).
+* `timeout` in `IOSim` no longer forks a thread to throw the timeout
+  exception: the scheduler delivers it, after every thread runnable when the
+  timeout fired has run.  `timeout` no longer leaves a thread behind, which
+  made `runSimStrictShutdown` fail with `FailureSloppyShutdown` when the
+  action finished at the deadline.  The trace no longer contains
+  `EventThreadForked` for a fired timeout, but `EventThrowTo` from the
+  `ThreadId [-1]` "timeout timer" pseudo-thread.  An action which finishes at
+  the deadline still wins, unless it yields after the deadline before it
+  finishes (e.g. on `atomically`).  If nested timeouts fire at the same time,
+  the inner one is delivered first.  `timeout` no longer allocates a lock
+  `TVar`, so `TVarId`s in traces after a `timeout` change.
 
 ## 1.11.0.0
 

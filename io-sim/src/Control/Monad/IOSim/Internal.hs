@@ -44,7 +44,7 @@ import Data.Coerce
 import Data.Deque.Strict (Deque)
 import Data.Deque.Strict qualified as Deque
 import Data.Dynamic
-import Data.Foldable (foldlM, toList, traverse_)
+import Data.Foldable (toList, traverse_)
 import Data.IntPSQ (IntPSQ)
 import Data.IntPSQ qualified as PSQ
 import Data.List qualified as List
@@ -65,9 +65,7 @@ import Data.STRef.Lazy
 
 import Control.Concurrent.Class.MonadSTM.TMVar
 import Control.Concurrent.Class.MonadSTM.TVar hiding (TVar)
-import Control.Monad.Class.MonadFork (killThread, myThreadId, throwTo)
 import Control.Monad.Class.MonadSTM hiding (STM)
-import Control.Monad.Class.MonadSTM.Internal (TMVarDefault (TMVar))
 import Control.Monad.Class.MonadThrow hiding (getMaskingState)
 import Control.Monad.Class.MonadTime
 import Control.Monad.Class.MonadTimer.SI (TimeoutState (..))
@@ -123,9 +121,10 @@ data TimerCompletionInfo s =
      | TimerThreadDelay !IOSimThreadId !TimeoutId
      -- ^ `threadDelay` timer run by `IOSimThreadId` which was assigned the given
      -- `TimeoutId` (only used to report in a trace).
-     | TimerTimeout !IOSimThreadId !TimeoutId !(TMVar (IOSim s) IOSimThreadId)
+     | TimerTimeout !IOSimThreadId !TimeoutId
      -- ^ `timeout` timer run by `IOSimThreadId` which was assigned the given
-     -- `TimeoutId` (only used to report in a trace).
+     -- `TimeoutId`.  When it fires, the scheduler delivers
+     -- `TimeoutException` to that thread (see `deliverTimeouts`).
 
 
 type Timeouts s = IntPSQ Time (TimerCompletionInfo s)
@@ -141,6 +140,11 @@ data SimState s a = SimState {
        curTime  :: !Time,
        -- | ordered list of timers and timeouts
        timers   :: !(Timeouts s),
+       -- | `timeout`s which fired, but whose `TimeoutException` is not yet
+       -- delivered, with the thread which runs the `timeout`.  They are
+       -- delivered when 'timeoutSentinel' reaches the front of the run queue
+       -- (see 'deliverTimeouts').
+       firedTimeouts :: !(Map TimeoutId IOSimThreadId),
        -- | list of clocks
        clocks   :: !(Map ClockId UTCTime),
        nextVid  :: !VarId,     -- ^ next unused 'VarId'
@@ -155,6 +159,7 @@ initialState =
       threads  = Map.empty,
       curTime  = Time 0,
       timers   = PSQ.empty,
+      firedTimeouts = Map.empty,
       clocks   = Map.singleton (ClockId []) epoch1970,
       nextVid  = 0,
       nextTmid = TimeoutId 0,
@@ -173,7 +178,7 @@ invariant (Just running) simstate@SimState{runqueue,threads,clocks} =
  . invariant Nothing simstate
 
 invariant Nothing SimState{runqueue,threads,clocks} =
-   assert (all (`Map.member` threads) runqueue)
+   assert (all (\tid -> tid == timeoutSentinel || tid `Map.member` threads) runqueue)
  . assert (and [ isThreadBlocked t == (threadId t `notElem` runqueue)
                | t <- Map.elems threads ])
  . assert (toList runqueue == List.nub (toList runqueue))
@@ -199,6 +204,7 @@ schedule !thread@Thread{
            runqueue,
            threads,
            timers,
+           firedTimeouts,
            clocks,
            nextVid, nextTmid, nextUniq,
            curTime  = time
@@ -235,52 +241,36 @@ schedule !thread@Thread{
         let thread' = thread { threadControl = ThreadControl (k x) ctl' }
         schedule thread' simstate
 
-      TimeoutFrame tmid lock k ctl' -> do
-        -- There is a possible race between timeout action and the timeout expiration.
-        -- We use a lock to solve the race.
-
-        cleanup <- tryTakeTimeoutLock (TimeoutLock tmid lock)
+      TimeoutFrame tmid _lock k ctl' -> do
+        -- The action finished first.  Remove the timeout: its timer if it has
+        -- not fired yet, its undelivered exception if it has fired, or its
+        -- pending exception if it was delivered but this thread was not
+        -- interruptible.  Otherwise the exception would be raised outside of
+        -- the frame.
         let thread' =
-              thread { threadControl =
-                          ThreadControl (case cleanup of
-                                           IOSim k' -> k' (\() -> k (Just x)))
-                                        ctl'
-                        -- If the assassin has already thrown, but we were not
-                        -- interruptible, its exception is pending.  Killing the
-                        -- assassin does not retract it (unlike in GHC's RTS),
-                        -- so we drop it here: otherwise it would be raised
-                        -- outside of the frame.
-                      , threadThrowTo =
-                          filter (\(e, _) -> fromException e
-                                          /= Just (TimeoutException tmid))
-                                 (threadThrowTo thread)
-                      }
-        schedule thread' simstate
+              thread { threadControl = ThreadControl (k (Just x)) ctl'
+                     , threadThrowTo = dropTimeoutException tmid (threadThrowTo thread)
+                     }
+            timers'        = (PSQ.delete . coerce) tmid timers
+            firedTimeouts' = Map.delete tmid firedTimeouts
+        schedule thread' simstate { timers        = timers'
+                                  , firedTimeouts = firedTimeouts' }
 
       DelayFrame tmid k ctl' -> do
         let thread' = thread { threadControl = ThreadControl k ctl' }
             timers' = (PSQ.delete . coerce) tmid timers
         schedule thread' simstate { timers = timers' }
 
-    Throw e -> case unwindControlStack e thread timers of
+    Throw e -> case unwindControlStack e thread timers firedTimeouts of
       -- Found a CatchFrame
-      (Right thread'@Thread { threadControl = ThreadControl handlerAction handlerCtl
-                            , threadMasking = maskst'
-                            }, timers'', locks) -> do
-        -- We found a suitable exception handler, continue with that,
-        -- but first cleanup any unwind `TimeoutFrame` locks
-        cleanup <- sequence_ <$> mapM tryTakeTimeoutLock locks
-        trace <- schedule thread' {
-                            threadControl =
-                              ThreadControl (case cleanup of
-                                               IOSim k' -> k' (\() -> handlerAction))
-                                            handlerCtl
-                          }
-                          simstate { timers = timers'' }
+      (Right thread'@Thread { threadMasking = maskst' }, timers'', fired'') -> do
+        -- We found a suitable exception handler, continue with that.
+        trace <- schedule thread' simstate { timers        = timers''
+                                           , firedTimeouts = fired'' }
         return (SimTrace time tid tlbl (EventThrow e) $
                 SimTrace time tid tlbl (EventMask maskst') trace)
 
-      (Left isMain, timers'', locks)
+      (Left isMain, timers'', fired'')
         -- We unwound and did not find any suitable exception handler, so we
         -- have an unhandled exception at the top level of the thread.
         | isMain ->
@@ -291,10 +281,8 @@ schedule !thread@Thread{
 
         | otherwise -> do
           -- An unhandled exception in any other thread terminates the thread
-          -- Take the lock but ignore `cleanup` action`, `deschedule Terminated`
-          -- never touches `threadControl` field, the thread is dropped.
-          _cleanup <- sequence_ <$> mapM tryTakeTimeoutLock locks
-          !trace <- deschedule Terminated thread simstate { timers = timers'' }
+          !trace <- deschedule Terminated thread simstate { timers        = timers''
+                                                          , firedTimeouts = fired'' }
           return $ SimTrace time tid tlbl (EventThrow e)
                  $ SimTrace time tid tlbl (EventThreadUnhandled e)
                  $ SimTrace time tid tlbl (EventDeschedule Terminated)
@@ -374,16 +362,14 @@ schedule !thread@Thread{
       error "schedule: StartTimeout: Impossible happened"
 
     StartTimeout d action' k -> do
-      !lock <- TMVar <$> execNewTVar (TMVarId nextVid) (Just $! "lock-" ++ show nextTmid) Nothing
       let !expiry    = d `addTime` time
-          !timers'   = (PSQ.insert . coerce) nextTmid expiry (TimerTimeout tid nextTmid lock) timers
+          !timers'   = (PSQ.insert . coerce) nextTmid expiry (TimerTimeout tid nextTmid) timers
           !thread'   = thread { threadControl =
                                  ThreadControl action'
-                                               (TimeoutFrame nextTmid lock k ctl)
+                                               (TimeoutFrame nextTmid noTimeoutLock k ctl)
                               }
       !trace <- deschedule Yield thread' simstate { timers   = timers'
                                                   , nextTmid = succ nextTmid
-                                                  , nextVid  = succ nextVid
                                                   }
       return (SimTrace time tid tlbl (EventTimeoutCreated nextTmid tid expiry) trace)
 
@@ -749,11 +735,24 @@ deschedule Sleep _thread _simstate =
 -- When there is no current running thread but the runqueue is non-empty then
 -- schedule the next one to run.
 reschedule :: SimState s a -> ST s (SimTrace a)
-reschedule !simstate@SimState{ runqueue, threads }
+reschedule !simstate@SimState{ runqueue, threads, curTime = time }
   | Just (!tid, runqueue') <- Deque.uncons runqueue =
-    let thread = threads Map.! tid in
-    schedule thread simstate { runqueue = runqueue'
-                             , threads  = Map.delete tid threads }
+    if tid == timeoutSentinel
+      then do
+        -- All the threads which were runnable when the `timeout`s fired have
+        -- run, deliver their exceptions.
+        let (delivered, simstate') =
+              deliverTimeouts simstate { runqueue = runqueue' }
+        trace <- reschedule simstate'
+        return $ traceMany
+                   [ ( time, l_labelled timeoutThrower, l_label timeoutThrower
+                     , EventThrowTo (toException (TimeoutException tmid)) tid')
+                   | (tid', tmid) <- reverse delivered ]
+                   trace
+      else
+        let thread = threads Map.! tid in
+        schedule thread simstate { runqueue = runqueue'
+                                 , threads  = Map.delete tid threads }
 
 -- But when there are no runnable threads, we advance the time to the next
 -- timer event, or stop.
@@ -781,12 +780,22 @@ reschedule !simstate@SimState{ threads, timers, curTime = time } =
               . snd . unblockThreads True  wakeupSTM
               $ simstate
 
-            -- For each 'timeout' action where the timeout has fired, start a
-            -- new thread to execute throwTo to interrupt the action.
-            !timeoutExpired = [ (tid, tmid, lock)
-                              | TimerTimeout tid tmid lock <- fired ]
-
-        !simstate'' <- forkTimeoutInterruptThreads timeoutExpired simstate'
+            -- For each 'timeout' action where the timeout has fired, interrupt
+            -- the action, but only after all the threads which are now
+            -- runnable had their turn (see 'deliverTimeouts').
+            !timeoutExpired = [ (tid, tmid)
+                              | TimerTimeout tid tmid <- fired ]
+            !simstate''
+              | null timeoutExpired
+              = simstate'
+              | otherwise
+              = assert (Map.null (firedTimeouts simstate')) $
+                simstate' { runqueue      = Deque.snoc timeoutSentinel
+                                                       (runqueue simstate')
+                          , firedTimeouts = Map.fromList
+                                              [ (tmid, tid)
+                                              | (tid, tmid) <- timeoutExpired ]
+                          }
 
         !trace <- reschedule simstate'' { curTime = time'
                                         , timers  = timers' }
@@ -811,10 +820,7 @@ reschedule !simstate@SimState{ threads, timers, curTime = time } =
                      | (tid, tmid) <- wakeupThreadDelay ]
                   ++ [ ( time', tid, Just "timeout timer"
                        , EventTimeoutFired tmid)
-                     | (tid, tmid, _) <- timeoutExpired ]
-                  ++ [ ( time', tid, Just "thread forked"
-                       , EventThreadForked tid)
-                     | (tid, _, _) <- timeoutExpired ])
+                     | (tid, tmid) <- timeoutExpired ])
                     trace
   where
     timeoutSTMAction :: TimerCompletionInfo s -> STM s ()
@@ -855,101 +861,113 @@ unblockThreads !onlySTM !wakeup !simstate@SimState {runqueue, threads} =
                    threads
                    unblocked
 
--- | This function receives a list of TimerTimeout values that represent threads
--- for which the timeout expired and kills the running thread if needed.
+-- | Deliver `TimeoutException`s for the `timeout`s which fired.
 --
--- This function is responsible for the second part of the race condition issue
--- and relates to the 'schedule's 'TimeoutFrame' locking explanation (here is
--- where the assassin threads are launched. So, as explained previously, at this
--- point in code, the timeout expired so we need to interrupt the running
--- thread. If the running thread finished at the same time the timeout expired
--- we have a race condition. To deal with this race condition what we do is
--- look at the lock value. If it is 'Locked' this means that the running thread
--- already finished (or won the race) so we can safely do nothing. Otherwise, if
--- the lock value is 'NotLocked' we need to acquire the lock and launch an
--- assassin thread that is going to interrupt the running one. Note that we
--- should run this interrupting thread in an unmasked state since it might
--- receive a 'ThreadKilled' exception.
+-- The scheduler interrupts the timed thread itself, rather than forking an
+-- assassin thread, which would race with the action and could outlive the
+-- `timeout` call (see `runSimStrictShutdown`).
 --
-forkTimeoutInterruptThreads :: forall s a.
-                               [(IOSimThreadId, TimeoutId, TMVar (IOSim s) IOSimThreadId)]
-                            -> SimState s a
-                            -> ST s (SimState s a)
-forkTimeoutInterruptThreads timeoutExpired simState =
-  foldlM (\st@SimState{ runqueue, threads }
-           (t, TMVar lock)
-          -> do
-            v <- execReadTVar lock
-            return $ case v of
-              Nothing -> st { runqueue = Deque.snoc (threadId t) runqueue,
-                              threads  = Map.insert (threadId t) t threads
-                            }
-              Just _  -> st
-          )
-          simState'
-          throwToThread
-
+-- When `timeout`s fire, they are recorded in 'firedTimeouts' and
+-- 'timeoutSentinel' is put at the back of the run queue: every thread which is
+-- runnable at that time, in particular the ones woken by timers which fired at
+-- the same time, runs before the exceptions are delivered.  Hence, if an
+-- action finishes at the time its `timeout` expires, the action wins.  The run
+-- queue is empty when timers fire, and the sentinel is put back only when it
+-- is taken from the run queue, so there is at most one sentinel in it.
+--
+-- A `timeout` is removed from 'firedTimeouts' when its `TimeoutFrame` is left,
+-- by returning or by unwinding.  Hence every `timeout` delivered here is
+-- associated with a live `TimeoutFrame`.
+--
+-- The exception is delivered exactly as by `ThrowTo`: if the thread is
+-- interruptible it is raised immediately, otherwise it is queued in
+-- 'threadThrowTo' and raised once the thread becomes interruptible, unless the
+-- frame is left first (see 'dropTimeoutException').  No thread is blocked on
+-- the queued exception; the 'threadThrowTo' entry carries 'timeoutThrower' as
+-- a placeholder.
+--
+-- If several nested `timeout`s of the same thread fired, only the innermost
+-- one (the one with the largest `TimeoutId`) is delivered, the others are
+-- kept in 'firedTimeouts' and 'timeoutSentinel' is put back at the end of the
+-- run queue.  Hence, if the inner `timeout` returns and then the outer one
+-- returns before the thread yields, the outer `timeout` returns
+-- @Just Nothing@; otherwise the outer `timeout` interrupts the thread.
+--
+-- Returns the delivered `timeout`s.
+--
+deliverTimeouts :: SimState s a
+                -> ([(IOSimThreadId, TimeoutId)], SimState s a)
+deliverTimeouts simstate@SimState { firedTimeouts = fired } =
+    -- The sentinel is put back after the delivery, behind the threads it
+    -- wakes up.
+    fmap requeue $
+    Map.foldlWithKey' deliver ([], simstate { firedTimeouts = remaining }) innermost
   where
-    -- we launch a thread responsible for throwing an AsyncCancelled exception
-    -- to the thread which timeout expired
-    throwToThread :: [(Thread s a, TMVar (IOSim s) IOSimThreadId)]
+    innermost :: Map IOSimThreadId TimeoutId
+    innermost = Map.fromListWith max [ (tid, tmid) | (tmid, tid) <- Map.toList fired ]
 
-    (simState', throwToThread) = List.mapAccumR fn simState timeoutExpired
+    remaining :: Map TimeoutId IOSimThreadId
+    remaining = Map.withoutKeys fired (Set.fromList (Map.elems innermost))
+
+    requeue :: SimState s a -> SimState s a
+    requeue st@SimState { runqueue }
+      | Map.null remaining = st
+      | otherwise          = st { runqueue = Deque.snoc timeoutSentinel runqueue }
+
+    deliver :: ([(IOSimThreadId, TimeoutId)], SimState s a)
+            -> IOSimThreadId -> TimeoutId
+            -> ([(IOSimThreadId, TimeoutId)], SimState s a)
+    deliver (delivered, st@SimState { threads }) tid tmid =
+      case Map.lookup tid threads of
+        Nothing -> error ("IOSim: internal error: unknown thread " ++ show tid)
+        Just t
+          | threadInterruptible t ->
+              let raise t'@Thread { threadControl = ThreadControl _ ctl } =
+                    t' { threadControl = ThreadControl (Throw e) ctl
+                       , threadStatus  = ThreadRunning
+                       }
+                  st'@SimState { threads = threads' } =
+                    snd (unblockThreads False [tid] st)
+              in ( (tid, tmid) : delivered
+                 , st' { threads = Map.adjust raise tid threads' }
+                 )
+          | otherwise ->
+              ( (tid, tmid) : delivered
+              , st { threads = Map.insert tid
+                                 t { threadThrowTo = (e, timeoutThrower)
+                                                   : threadThrowTo t }
+                                 threads
+                   }
+              )
       where
-        fn :: SimState s a
-           -> (IOSimThreadId, TimeoutId, TMVar (IOSim s) IOSimThreadId)
-           -> (SimState s a, (Thread s a, TMVar (IOSim s) IOSimThreadId))
-        fn state@SimState { threads } (tid, tmid, lock) =
-          let t = case tid `Map.lookup` threads of
-                    Just t' -> t'
-                    Nothing -> error ("IOSim: internal error: unknown thread " ++ show tid)
-              nextId   = threadNextTId t
-          in ( state { threads = Map.insert tid t { threadNextTId = succ nextId } threads }
-             , ( Thread { threadId      = childThreadId tid nextId,
-                            threadControl =
-                              ThreadControl
-                               (runIOSim $ do
-                                  -- assassin thread
-                                  mtid <- myThreadId
-                                  v2 <- atomically $ tryPutTMVar lock mtid
-                                  when v2 $
-                                    throwTo tid (toException (TimeoutException tmid)))
-                               ForkFrame,
-                            threadStatus  = ThreadRunning,
-                            threadMasking = Unmasked,
-                            threadThrowTo = [],
-                            threadClockId = threadClockId t,
-                            threadLabel   = Just "timeout-forked-thread",
-                            threadNextTId = 1
-                          }
-                , lock
-                )
-             )
+        e = toException (TimeoutException tmid)
 
+-- | A placeholder in the run queue, see 'deliverTimeouts'.  It is not a
+-- thread.
+--
+timeoutSentinel :: IOSimThreadId
+timeoutSentinel = ThreadId [-1]
 
-data TimeoutLock s =
-  TimeoutLock
-    TimeoutId
-    (TMVar (IOSim s) IOSimThreadId)
+-- | The thrower recorded with a queued `TimeoutException`.  It is not a
+-- thread, so 'unblockThreads' ignores it.
+--
+timeoutThrower :: Labelled IOSimThreadId
+timeoutThrower = Labelled timeoutSentinel (Just "timeout timer")
 
+-- | Drop the pending `TimeoutException` of the given timeout when its frame is
+-- left.
+--
+dropTimeoutException :: TimeoutId
+                     -> [(SomeException, Labelled IOSimThreadId)]
+                     -> [(SomeException, Labelled IOSimThreadId)]
+dropTimeoutException tmid =
+    filter (\(e, _) -> fromException e /= Just (TimeoutException tmid))
 
-tryTakeTimeoutLock
-  :: TimeoutLock s
-  -> ST s (IOSim s ())
-tryTakeTimeoutLock (TimeoutLock tmid lock) = do
-  -- We cannot do `tryPutMVar` in the `treadAction`, because we need to
-  -- know if the `lock` is empty right now when we still have the frame.
-  v <- execTryPutTMVar lock undefined
-  -- Either unregister the timeout, or kill the assassin throwing thread,
-  -- then carry on the continuation.
-  --
-  -- If the assassin holds the lock, we take it here rather than with
-  -- `atomically` in the `threadAction`: committing a transaction yields,
-  -- and the assassin could throw before we kill it, after the frame is
-  -- gone.  `killThread` does not yield before the exception is
-  -- delivered, and the assassin is unmasked, so it never blocks.
-  if v then return (unsafeUnregisterTimeout tmid)
-       else killThread <$> execTakeTMVar lock
+-- | 'IOSim' does not use the lock of a 'TimeoutFrame' (only 'IOSimPOR' does).
+--
+noTimeoutLock :: TMVar (IOSim s) IOSimThreadId
+noTimeoutLock = error "IOSim: internal error: TimeoutFrame lock is not used"
+
 
 -- | Iterate through the control stack to find an enclosing exception handler
 -- of the right type, or unwind all the way to the top level for the thread.
@@ -963,34 +981,39 @@ unwindControlStack :: forall s a.
                       SomeException
                    -> Thread s a
                    -> Timeouts s
+                   -> Map TimeoutId IOSimThreadId
                    -> ( Either Bool (Thread s a)
                       , Timeouts s
-                      , [TimeoutLock s]
+                      , Map TimeoutId IOSimThreadId
                       )
                    -- ^ a tuple containing
                    --
                    -- * returns cleanly or on `MainFrame` / `ForkFrame`
-                   -- * timers 
+                   -- * timers
+                   -- * fired timeouts
                    --
-unwindControlStack e = \thread timers ->
+unwindControlStack e = \thread timers fired ->
     case threadControl thread of
       ThreadControl _ ctl ->
-        unwind thread ctl timers []
+        unwind thread ctl timers fired
   where
     unwind :: forall s' c.
               Thread s a
            -> ControlStack s' c a
            -> IntPSQ Time (TimerCompletionInfo s)
-           -> [TimeoutLock s']
-           -> (Either Bool (Thread s' a), IntPSQ Time (TimerCompletionInfo s), [TimeoutLock s'])
-    unwind _  MainFrame                 timers locks = (Left True, timers, reverse locks)
-    unwind _  ForkFrame                 timers locks = (Left False, timers, reverse locks)
-    unwind thread (MaskFrame _k maskst' ctl) timers locks = unwind thread { threadMasking = maskst' } ctl timers locks
+           -> Map TimeoutId IOSimThreadId
+           -> ( Either Bool (Thread s' a)
+              , IntPSQ Time (TimerCompletionInfo s)
+              , Map TimeoutId IOSimThreadId
+              )
+    unwind _  MainFrame                 timers fired = (Left True, timers, fired)
+    unwind _  ForkFrame                 timers fired = (Left False, timers, fired)
+    unwind thread (MaskFrame _k maskst' ctl) timers fired = unwind thread { threadMasking = maskst' } ctl timers fired
 
-    unwind thread (CatchFrame handler k ctl) timers locks =
+    unwind thread (CatchFrame handler k ctl) timers fired =
       case fromException e of
         -- not the right type, unwind to the next containing handler
-        Nothing -> unwind thread ctl timers locks
+        Nothing -> unwind thread ctl timers fired
 
         -- Ok! We will be able to continue the thread with the handler
         -- followed by the continuation after the catch
@@ -1002,7 +1025,7 @@ unwindControlStack e = \thread timers ->
                              threadMasking = atLeastInterruptibleMask (threadMasking thread)
                            }
                    , timers
-                   , reverse locks
+                   , fired
                    )
 
     -- Either Timeout fired or the action threw an exception.
@@ -1010,30 +1033,30 @@ unwindControlStack e = \thread timers ->
     --   so we need to run the continuation with a Nothing value.
     -- - If the timeout action threw an exception we need to keep unwinding the
     --   control stack looking for a handler to this exception.
-    unwind thread (TimeoutFrame tmid lock k ctl) timers locks =
+    unwind thread (TimeoutFrame tmid _lock k ctl) timers fired =
         case fromException e of
           -- Exception came from timeout expiring
           Just (TimeoutException tmid') | tmid == tmid' ->
-              (Right thread { threadControl = ThreadControl (k Nothing) ctl }, timers', reverse locks)
+              (Right thread { threadControl = ThreadControl (k Nothing) ctl }, timers', fired')
             -- Exception came from a different exception
           _ -> unwind thread { threadThrowTo =
-                                -- If the assassin has already thrown, but we were not
-                                -- interruptible, its exception is pending.  Killing the
-                                -- assassin does not retract it (unlike in GHC's RTS),
-                                -- so we drop it here: otherwise it would be raised
-                                -- outside of the frame.
-                                filter (\(e', _) -> fromException e' /= Just (TimeoutException tmid))
-                                       (threadThrowTo thread)
+                                -- If the timer has already fired, but we were
+                                -- not interruptible, its exception is pending.
+                                -- Drop it, otherwise it would be raised outside
+                                -- of the frame.
+                                dropTimeoutException tmid (threadThrowTo thread)
                               }
                       ctl
                       timers'
-                      (TimeoutLock tmid lock : locks)
+                      fired'
       where
-        -- Remove the timeout associated with the 'TimeoutFrame'.
+        -- Remove the timeout associated with the 'TimeoutFrame', whether it
+        -- has fired or not.
         timers' = (PSQ.delete . coerce) tmid timers
+        fired'  = Map.delete tmid fired
 
-    unwind thread (DelayFrame tmid _k ctl) timers locks =
-        unwind thread ctl timers' locks
+    unwind thread (DelayFrame tmid _k ctl) timers fired =
+        unwind thread ctl timers' fired
       where
         -- Remove the timeout associated with the 'DelayFrame'.
         timers' = (PSQ.delete . coerce) tmid timers
@@ -1313,24 +1336,6 @@ execNewTVar !tvarId !mbLabel x = do
 execWriteTVar :: TVar s a -> a -> ST s ()
 execWriteTVar TVar{tvarCurrent} = writeSTRef tvarCurrent
 {-# INLINE execWriteTVar #-}
-
-execTryPutTMVar :: TMVar (IOSim s) a -> a -> ST s Bool
-execTryPutTMVar (TMVar var) a = do
-    v <- execReadTVar var
-    case v of
-      Nothing -> execWriteTVar var (Just a)
-              >> return True
-      Just _  -> return False
-{-# INLINE execTryPutTMVar #-}
-
-execTakeTMVar :: TMVar (IOSim s) a -> ST s a
-execTakeTMVar (TMVar var) = do
-    v <- execReadTVar var
-    case v of
-      Just a  -> execWriteTVar var Nothing
-              >> return a
-      Nothing -> error "execTakeTMVar: empty TMVar"
-{-# INLINE execTakeTMVar #-}
 
 saveTVar :: TVar s a -> ST s ()
 saveTVar TVar{tvarCurrent, tvarUndo} = do
