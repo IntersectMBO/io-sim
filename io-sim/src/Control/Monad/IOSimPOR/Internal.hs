@@ -1314,7 +1314,16 @@ unwindControlStack e thread = \timeouts ->
         case fromException e of
           -- Exception came from timeout expiring
           Just (TimeoutException tmid')  | tmid == tmid' ->
-            (Right thread { threadControl = ThreadControl (k Nothing) ctl }, timers')
+            (Right thread { threadControl = ThreadControl (k Nothing) ctl
+                          , threadThrowTo =
+                            -- If the assassin has already thrown, but we were not
+                            -- interruptible, its exception is pending.  Killing the
+                            -- assassin does not retract it (unlike in GHC's RTS),
+                            -- so we drop it here: otherwise it would be raised
+                            -- outside of the frame.
+                              filter (\(e', _, _) -> fromException e' /= Just (TimeoutException tmid))
+                                     (threadThrowTo thread)
+                          }, timers')
             -- Exception came from a different exception
           _ -> unwind maskst ctl timers'
       where
