@@ -976,24 +976,25 @@ forkTimeoutInterruptThreads timeoutExpired simState =
                     Just t' -> t'
                     Nothing -> error ("IOSim: internal error: unknown thread " ++ show tid)
               nextId   = threadNextTId t
+
+              -- assassin thread
+              action :: IOSim s ()
+              action = do
+                mtid <- myThreadId
+                v2 <- atomically $ tryPutTMVar lock mtid
+                when v2 $
+                  throwTo tid (toException (TimeoutException tmid))
+
           in ( state { threads = Map.insert tid t { threadNextTId = succ nextId } threads }
              , ( Thread { threadId      = childThreadId tid nextId,
-                            threadControl =
-                              ThreadControl
-                               (runIOSim $ do
-                                  -- assassin thread
-                                  mtid <- myThreadId
-                                  v2 <- atomically $ tryPutTMVar lock mtid
-                                  when v2 $
-                                    throwTo tid (toException (TimeoutException tmid)))
-                               ForkFrame,
-                            threadStatus  = ThreadRunning,
-                            threadMasking = Unmasked,
-                            threadThrowTo = [],
-                            threadClockId = threadClockId t,
-                            threadLabel   = Just "timeout-forked-thread",
-                            threadNextTId = 1
-                          }
+                          threadControl = ThreadControl (runIOSim action) ForkFrame,
+                          threadStatus  = ThreadRunning,
+                          threadMasking = Unmasked,
+                          threadThrowTo = [],
+                          threadClockId = threadClockId t,
+                          threadLabel   = Just "timeout-forked-thread",
+                          threadNextTId = 1
+                        }
                 , lock
                 )
              )
