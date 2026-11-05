@@ -411,6 +411,40 @@ prop_catch_throwIO_masking_state ms =
         ms' <- getMaskingState
         return $ ms' === MaskedInterruptible `maxMS` ms
 
+-- | The masking state is restored when an exception, thrown under a different
+-- masking state, is caught.  The exception is thrown under @ms'@: @restore@
+-- unmasks first, since @'setMaskingState_' 'Unmasked'@ does not unmask.
+--
+prop_catch_restores_masking_state :: forall m. MonadMask m
+                                  => MaskingState
+                                  -> MaskingState
+                                  -> m Property
+prop_catch_restores_masking_state ms ms' =
+    setMaskingState ms $ \restore -> do
+      _ <- try @_ @IOError $
+             restore (setMaskingState_ ms' (throwIO (userError "error")))
+      ms'' <- getMaskingState
+      return $ ms'' === ms
+
+-- | The masking state is restored when 'timeout' fires, whatever the masking
+-- state of the timed action.  The action runs under @ms'@ (see
+-- 'prop_catch_restores_masking_state'), and the timeout is set to fire before
+-- it finishes.
+--
+prop_timeout_restores_masking_state :: forall m. ( MonadMask  m
+                                                 , MonadDelay m
+                                                 , MonadTimer m
+                                                 )
+                                    => MaskingState
+                                    -> MaskingState
+                                    -> m Property
+prop_timeout_restores_masking_state ms ms' =
+    setMaskingState ms $ \restore -> do
+      -- timeout before the action finish
+      _ <- timeout 0.01 (restore (setMaskingState_ ms' (threadDelay 0.05)))
+      ms'' <- getMaskingState
+      return $ ms'' === ms
+
 -- | Like 'prop_catch_masking_state' but using 'throwTo'.
 --
 prop_catch_throwTo_masking_state :: forall m.
@@ -610,3 +644,17 @@ prop_timeout_forwarded_exception_rethrown = do
     -- the forwarding thread's `throwTo` returned
     atomically (takeTMVar done)
     return $ counterexample (show r) (isLeft r)
+
+-- | See 'timeout_raises_pending_exception': the timeout's exception is raised
+-- when the action unmasks.
+--
+prop_timeout_raises_pending_exception_on_unmask
+  :: forall m. ( MonadDelay m
+               , MonadFork  m
+               , MonadMask  m
+               , MonadTimer m
+               )
+  => m Property
+prop_timeout_raises_pending_exception_on_unmask =
+    timeout_raises_pending_exception
+      (uninterruptibleMask_ . threadDelay . (+0.1))

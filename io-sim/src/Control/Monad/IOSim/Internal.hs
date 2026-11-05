@@ -703,30 +703,12 @@ deschedule Yield !thread !simstate@SimState{runqueue, threads} =
         threads'  = Map.insert (threadId thread) thread threads in
     reschedule simstate { runqueue = runqueue', threads  = threads' }
 
-deschedule Interruptable !thread@Thread {
-                           threadId      = tid,
-                           threadControl = ThreadControl _ ctl,
-                           threadMasking = Unmasked,
-                           threadThrowTo = (e, tid') : etids,
-                           threadLabel   = tlbl
-                         }
-                         !simstate@SimState{ curTime = time, threads } =
-
+deschedule Interruptable !thread@Thread { threadMasking = Unmasked
+                                        , threadThrowTo = _ : _ } !simstate =
     -- We're unmasking, but there are pending blocked async exceptions.
     -- So immediately raise the exception and unblock the blocked thread
     -- if possible.
-    let thread' = thread { threadControl = ThreadControl (Throw e) ctl
-                         , threadMasking = MaskedInterruptible
-                         , threadThrowTo = etids }
-        (unblocked,
-         simstate') = unblockThreads False [l_labelled tid'] simstate
-    in do
-    trace <- schedule thread' simstate'
-    return $ SimTrace time tid tlbl (EventThrowToUnmasked tid')
-           $ traceMany [ (time, tid'', tlbl'', EventThrowToWakeup)
-                       | tid'' <- unblocked
-                       , let tlbl'' = lookupThreadLabel tid'' threads ]
-             trace
+    schedulePendingThrowTo thread simstate
 
 deschedule Interruptable !thread !simstate =
     -- Either masked or unmasked but no pending async exceptions.
@@ -740,7 +722,7 @@ deschedule (Blocked _blockedReason) !thread@Thread { threadThrowTo = _ : _
     -- we have async exceptions masked, and there are pending blocked async
     -- exceptions. So immediately raise the exception and unblock the blocked
     -- thread if possible.
-    deschedule Interruptable thread { threadMasking = Unmasked } simstate
+    schedulePendingThrowTo thread simstate
 
 deschedule (Blocked blockedReason) !thread !simstate@SimState{threads} =
     let thread'  = thread { threadStatus = ThreadBlocked blockedReason }
@@ -763,6 +745,37 @@ deschedule Terminated !thread !simstate@SimState{ curTime = time, threads } =
 
 deschedule Sleep _thread _simstate =
     error "IOSim: impossible happend"
+
+-- | Raise the first pending async exception of a thread, and unblock the
+-- thread which threw it.
+--
+schedulePendingThrowTo :: Thread s a
+                       -> SimState s a
+                       -> ST s (SimTrace a)
+schedulePendingThrowTo !thread@Thread {
+                       threadId      = tid,
+                       threadControl = ThreadControl _ ctl,
+                       threadThrowTo = (e, tid') : etids,
+                       threadLabel   = tlbl
+                     }
+                     !simstate@SimState{ curTime = time, threads } =
+    -- Unlike in `IOSimPOR` case, we don't need to set masking state and add
+    -- a `MaskFrame` to ensure there's no other thread that could replace the
+    -- `Throw e` instruction.  We schedule the `thread'`, it will run `Throw e`
+    -- directly before any future `reschedule`.
+    let thread' = thread { threadControl = ThreadControl (Throw e) ctl
+                         , threadThrowTo = etids }
+        (unblocked,
+         simstate') = unblockThreads False [l_labelled tid'] simstate
+    in do
+    trace <- schedule thread' simstate'
+    return $ SimTrace time tid tlbl (EventThrowToUnmasked tid')
+           $ traceMany [ (time, tid'', tlbl'', EventThrowToWakeup)
+                       | tid'' <- unblocked
+                       , let tlbl'' = lookupThreadLabel tid'' threads ]
+             trace
+schedulePendingThrowTo _ _ =
+    error "IOSim: schedulePendingThrowTo: no pending async exceptions"
 
 -- When there is no current running thread but the runqueue is non-empty then
 -- schedule the next one to run.

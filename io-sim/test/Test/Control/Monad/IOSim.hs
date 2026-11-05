@@ -69,6 +69,10 @@ tests =
     , testProperty "async exceptions 3"     unit_timeouts_and_async_exceptions_3
     , testProperty "assassin: holds the lock"
     $ forall_masking_states unit_timeout_assassin_holds_lock
+    , testProperty "assassin: frame unwound"
+    $ forall_masking_states unit_timeout_assassin_frame_unwound
+    , testProperty "assassin: stacked frames unwound"
+    $ forall_masking_states unit_timeout_assassin_stacked_frames_unwound
     , testProperty "forwarded timeout exception"
                                             unit_timeout_forwarded_exception
     , testProperty "threadDelay and STM"    unit_threadDelay_and_stm
@@ -122,6 +126,20 @@ tests =
     , testProperty "catch (IOSim)"
     $ forall_masking_states unit_catch_throwIO_masking_state_ST
 
+    , testProperty "catch: restores masking state (IO)"
+    $ forall_masking_states $ \ms  ->
+      forall_masking_states $ \ms' -> unit_catch_restores_masking_state_IO ms ms'
+    , testProperty "catch: restores masking state (IOSim)"
+    $ forall_masking_states $ \ms  ->
+      forall_masking_states $ \ms' -> unit_catch_restores_masking_state_ST ms ms'
+
+    , testProperty "timeout: restores masking state (IO)"
+    $ forall_masking_states $ \ms  ->
+      forall_masking_states $ \ms' -> unit_timeout_restores_masking_state_IO ms ms'
+    , testProperty "timeout: restores masking state (IOSim)"
+    $ forall_masking_states $ \ms  ->
+      forall_masking_states $ \ms' -> unit_timeout_restores_masking_state_ST ms ms'
+
     , testProperty "catch: throwTo (IO)"
     $ forall_masking_states unit_catch_throwTo_masking_state_IO
     , testProperty "catch: throwTo (IOSim)"
@@ -169,6 +187,10 @@ tests =
         unit_timeout_forwarded_exception_rethrown_IO
     , testProperty "forwarded timeout exception, rethrown (IOSim)"
         unit_timeout_forwarded_exception_rethrown_ST
+    , testProperty "raised when timeout returns, on unmask (IO)"
+        unit_timeout_raises_pending_exception_on_unmask_IO
+    , testProperty "raised when timeout returns, on unmask (IOSim)"
+        unit_timeout_raises_pending_exception_on_unmask_ST
     ]
   , testGroup "STM reference semantics"
     [ testProperty "Reference vs IO"    prop_stm_referenceIO
@@ -1225,6 +1247,56 @@ unit_timeout_assassin_holds_lock ms = once $
       return (r === Just ())
 
 
+-- | The action throws at the deadline, and the exception unwinds through the
+-- `TimeoutFrame`.  The assassin is forked, but has not run yet: it must not
+-- throw after the frame is left (#269).
+--
+-- The timed thread is woken by its `threadDelay` timer before the assassin is
+-- forked, so it throws first.
+--
+unit_timeout_assassin_frame_unwound :: MaskingState -> Property
+unit_timeout_assassin_frame_unwound ms = once $
+    let trace = runSimTrace experiment in
+        counterexample (ppTrace_ trace)
+      . either (\e -> counterexample (show e) False) id
+      . traceResult False
+      $ trace
+  where
+    experiment :: IOSim s Property
+    experiment = do
+      r <- try $ setMaskingState_ ms $
+             timeout 1 (threadDelay 1 >> throwIO DivideByZero)
+      -- an interruptible point, a stale exception would be raised here
+      threadDelay 1
+      return (r === (Left DivideByZero :: Either ArithException (Maybe ())))
+
+
+-- | Like 'unit_timeout_assassin_frame_unwound', but the exception unwinds
+-- through two `TimeoutFrame`s, whose assassins are both forked (#269).
+--
+unit_timeout_assassin_stacked_frames_unwound :: MaskingState -> Property
+unit_timeout_assassin_stacked_frames_unwound ms = once $
+    let trace = runSimTrace experiment in
+        counterexample (ppTrace_ trace)
+      . either (\e -> counterexample (show e) False) id
+      . traceResult False
+      $ trace
+  where
+    experiment :: IOSim s Property
+    experiment = do
+      r <- try $ setMaskingState_ ms $
+             timeout 1 (timeout 1 (threadDelay 1 >> throwIO DivideByZero))
+      -- interruptible points, a stale exception would be raised here
+      threadDelay 1
+      threadDelay 1
+      return $ case r :: Either ArithException (Maybe (Maybe ())) of
+        Left DivideByZero    -> property True
+        -- one of the timeouts won
+        Right Nothing        -> property True
+        Right (Just Nothing) -> property True
+        _                    -> counterexample (show r) False
+
+
 -- | The timed thread catches the `TimeoutException` of its `timeout`, and
 -- another thread throws it back while the timed thread is masked within the
 -- frame.  The forwarded exception must be raised after the frame is left.
@@ -1391,6 +1463,22 @@ unit_catch_throwIO_masking_state_IO ms = once $
 unit_catch_throwIO_masking_state_ST :: MaskingState -> Property
 unit_catch_throwIO_masking_state_ST ms = once $
     runSimOrThrow (prop_catch_throwIO_masking_state ms)
+
+unit_catch_restores_masking_state_IO :: MaskingState -> MaskingState -> Property
+unit_catch_restores_masking_state_IO ms ms' = once $
+    ioProperty $ prop_catch_restores_masking_state ms ms'
+
+unit_catch_restores_masking_state_ST :: MaskingState -> MaskingState -> Property
+unit_catch_restores_masking_state_ST ms ms' = once $
+    runSimOrThrow (prop_catch_restores_masking_state ms ms')
+
+unit_timeout_restores_masking_state_IO :: MaskingState -> MaskingState -> Property
+unit_timeout_restores_masking_state_IO ms ms' = once $
+    ioProperty $ prop_timeout_restores_masking_state ms ms'
+
+unit_timeout_restores_masking_state_ST :: MaskingState -> MaskingState -> Property
+unit_timeout_restores_masking_state_ST ms ms' = once $
+    runSimOrThrow (prop_timeout_restores_masking_state ms ms')
 
 unit_catch_throwTo_masking_state_IO :: MaskingState -> Property
 unit_catch_throwTo_masking_state_IO = once .
@@ -1644,3 +1732,11 @@ unit_timeout_forwarded_exception_rethrown_IO =
 unit_timeout_forwarded_exception_rethrown_ST :: Property
 unit_timeout_forwarded_exception_rethrown_ST =
     once $ ioSimProperty False prop_timeout_forwarded_exception_rethrown
+
+unit_timeout_raises_pending_exception_on_unmask_IO :: Property
+unit_timeout_raises_pending_exception_on_unmask_IO =
+    once $ ioProperty prop_timeout_raises_pending_exception_on_unmask
+
+unit_timeout_raises_pending_exception_on_unmask_ST :: Property
+unit_timeout_raises_pending_exception_on_unmask_ST =
+    once $ ioSimProperty False prop_timeout_raises_pending_exception_on_unmask
