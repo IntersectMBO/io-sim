@@ -78,6 +78,14 @@ tests =
       , testProperty "timeouts"               prop_timeouts
       , testProperty "stacked timeouts"       prop_stacked_timeouts
       , testProperty "{register,thread}Delay" unit_registerDelay_threadDelay
+        -- When unmasked, the exception of the assassin is raised as soon as
+        -- it is thrown, so the paths these tests are for are never reached.
+      , testProperty "assassin: pending throw"
+      $ forall_masked_states unit_timeout_assassin_pending_throw
+      , testProperty "assassin: holds the lock"
+      $ forall_masked_states unit_timeout_assassin_holds_lock
+      , testProperty "assassin: frame unwound"
+      $ forall_masked_states unit_timeout_assassin_frame_unwound
       , testProperty "forwarded timeout exception"
                                               unit_timeout_forwarded_exception
       ]
@@ -142,10 +150,20 @@ tests =
     , testGroup "pending async exceptions"
       [ testProperty "raised when timeout returns, at blocking op"
           unit_timeout_raises_pending_exception_at_blocking_op_ST
+      , testProperty "stacked timeouts: inner assassin not leaked"
+          unit_timeout_stacked_pending_exception_ST
       , testProperty "forwarded timeout exception, rethrown"
           unit_timeout_forwarded_exception_rethrown_ST
       , testProperty "raised when timeout returns, on unmask"
           unit_timeout_raises_pending_exception_on_unmask_ST
+      ]
+    , testGroup "throwTo cancellation"
+      [ testProperty "interrupted by a pending exception"
+          unit_throwTo_interrupted_by_pending_exception_ST
+      , testProperty "thrower killed"
+          unit_throwTo_thrower_killed_ST
+      , testProperty "thrower not woken"
+          unit_throwTo_cancelled_thrower_not_woken_ST
       ]
     , testGroup "STM reference semantics"
       [ testProperty "Reference vs Sim"   prop_stm_referenceSim
@@ -1180,9 +1198,37 @@ ioSimPORProperty strict iosim =
       $ trace
 
 
+-- | The assassin of a `timeout` throws while the timed thread is masked and
+-- runnable, so its exception is pending when the action finishes.  It must
+-- not be raised after `timeout` returns (#269).
+--
+-- `timeout` runs in a forked thread, so that the steps of its assassin are
+-- racy as well.
+--
+unit_timeout_assassin_pending_throw :: MaskingState -> Property
+unit_timeout_assassin_pending_throw ms =
+    ioSimPORProperty False experiment
+  where
+    experiment :: IOSim s Property
+    experiment = do
+      flag <- newTVarIO False
+      w <- async $ threadDelay 1 >> atomically (writeTVar flag True)
+      r <- waitCatch =<< async (setMaskingState_ ms $
+             timeout 1 (atomically (readTVar flag >>= check)))
+      -- The simulation ends when the main thread returns: if it did not wait
+      -- for the writer, the writer would not run in the schedules in which
+      -- the assassin throws first, and their race would not be explored.
+      wait w
+      return $ case r of
+        Left e  -> counterexample (show e) False
+        Right _ -> property True
+
+
 -- | The timed thread catches the `TimeoutException` of its `timeout`, and
 -- another thread throws it back while the timed thread is masked within the
--- frame.  The forwarded exception must be raised after the frame is left.
+-- frame.  Leaving the frame must only retract the assassin's exception, not
+-- the forwarded one: otherwise the forwarding thread stays blocked in
+-- `throwTo` forever.
 --
 unit_timeout_forwarded_exception :: Property
 unit_timeout_forwarded_exception =
@@ -1208,6 +1254,55 @@ unit_timeout_forwarded_exception =
       atomically (takeTMVar done)
       return $ counterexample (show r)
              $ isLeft (r :: Either SomeException ())
+
+
+-- | The assassin of a `timeout` takes the lock, but the action finishes
+-- before it throws.  The exception must not be raised after `timeout`
+-- returns (#269).
+--
+-- `timeout` runs in a forked thread, so that the steps of its assassin are
+-- racy as well.
+--
+unit_timeout_assassin_holds_lock :: MaskingState -> Property
+unit_timeout_assassin_holds_lock ms =
+    ioSimPORProperty False experiment
+  where
+    experiment :: IOSim s Property
+    experiment = do
+      r <- waitCatch =<< async (setMaskingState_ ms $
+             timeout 1 (threadDelay 1 >> atomically (return ())))
+      return $ case r of
+        Left e  -> counterexample (show e) False
+        Right _ -> property True
+
+
+-- | The action throws at the deadline, and the exception unwinds through the
+-- `TimeoutFrame` and is caught outside of it.  The assassin must not throw
+-- after the frame is left, and its exception must not be pending (#269).
+--
+-- `timeout` runs in a forked thread, so that the steps of its assassin are
+-- racy as well.
+--
+unit_timeout_assassin_frame_unwound :: MaskingState -> Property
+unit_timeout_assassin_frame_unwound ms =
+    ioSimPORProperty False experiment
+  where
+    experiment :: IOSim s Property
+    experiment = do
+      r <- waitCatch =<< async (do
+             r <- try $ setMaskingState_ ms $
+                    timeout 1 ( threadDelay 1
+                             >> atomically (return ())
+                             >> throwIO DivideByZero)
+             -- an interruptible point, a stale exception would be raised here
+             threadDelay 1
+             return (r :: Either ArithException (Maybe ())))
+      return $ case r of
+        Left e                    -> counterexample (show e) False
+        -- the timeout won
+        Right (Right Nothing)     -> property True
+        Right (Left DivideByZero) -> property True
+        Right r'                  -> counterexample (show r') False
 
 --
 -- MonadMask properties
@@ -1274,6 +1369,14 @@ unit_timeout_raises_pending_exception_at_blocking_op_ST =
     once $ ioSimPORProperty False
          $ prop_timeout_raises_pending_exception_at_blocking_op
 
+-- | The simulation also fails if any thread, e.g. the inner assassin, is
+-- still running or blocked when the main thread returns.
+--
+unit_timeout_stacked_pending_exception_ST :: Property
+unit_timeout_stacked_pending_exception_ST =
+    once $ ioSimPORProperty True
+         $ prop_timeout_stacked_pending_exception
+
 unit_timeout_forwarded_exception_rethrown_ST :: Property
 unit_timeout_forwarded_exception_rethrown_ST =
     once $ ioSimPORProperty False
@@ -1283,3 +1386,22 @@ unit_timeout_raises_pending_exception_on_unmask_ST :: Property
 unit_timeout_raises_pending_exception_on_unmask_ST =
     once $ ioSimPORProperty False
          $ prop_timeout_raises_pending_exception_on_unmask
+
+unit_throwTo_interrupted_by_pending_exception_ST :: Property
+unit_throwTo_interrupted_by_pending_exception_ST =
+    once $ ioSimPORProperty False
+         $ prop_throwTo_interrupted_by_pending_exception
+
+unit_throwTo_thrower_killed_ST :: Property
+unit_throwTo_thrower_killed_ST =
+    once $ ioSimPORProperty False $ prop_throwTo_thrower_killed
+
+unit_throwTo_cancelled_thrower_not_woken_ST :: Property
+unit_throwTo_cancelled_thrower_not_woken_ST = once $
+    exploreSimTrace id
+      (exploreRaces >> prop_throwTo_cancelled_thrower_not_woken)
+      $ \_ trace ->
+        counterexample (ppTrace_ trace)
+      . either (\e -> counterexample (show e) False) id
+      . traceResult False
+      $ trace

@@ -243,6 +243,10 @@ schedule !thread@Thread{
               maybe (unsafeUnregisterTimeout tmid)
                     killThread
           <$> closeTimeoutLock (TimeoutLock tmid lock)
+        -- If the assassin has already thrown, but we were not
+        -- interruptible, its exception is pending.  `cleanup` kills the
+        -- assassin, which cancels its `throwTo` and retracts the pending
+        -- exception (see `dropThrowToFrom`).
         let thread' =
               thread { threadControl =
                           ThreadControl (unIOSim cleanup (\() -> k (Just x)))
@@ -624,16 +628,24 @@ schedule !thread@Thread{
                         Just t -> not (threadInterruptible t)
                         _      -> False
       if willBlock
-        then do
-          -- The target thread has async exceptions masked so we add the
-          -- exception and the source thread id to the pending async exceptions.
-          let adjustTarget t = t { threadThrowTo = (e, Labelled tid tlbl) : threadThrowTo t }
-              threads'       = Map.adjust adjustTarget tid' threads
-          !trace <- deschedule (Blocked BlockedOnThrowTo) thread' simstate { threads = threads' }
-          return $ SimTrace time tid tlbl (EventThrowTo e tid')
-                 $ SimTrace time tid tlbl EventThrowToBlocked
-                 $ SimTrace time tid tlbl (EventDeschedule (Blocked BlockedOnThrowTo))
-                 $ trace
+        then case threadThrowTo thread of
+          -- `throwTo` blocks, which is an interruptible point: if we have
+          -- pending async exceptions, and are not `MaskedUninterruptible`, one
+          -- of them is raised instead, and `e` is neither thrown nor traced.
+          _ : _ | maskst /= MaskedUninterruptible -> do
+            !trace <- schedulePendingThrowTo thread' simstate
+            return $ SimTrace time tid tlbl (EventDeschedule Interruptable)
+                   $ trace
+          _ -> do
+            -- The target thread has async exceptions masked so we add the
+            -- exception and the source thread id to the pending async exceptions.
+            let adjustTarget t = t { threadThrowTo = (e, Labelled tid tlbl) : threadThrowTo t }
+                threads'       = Map.adjust adjustTarget tid' threads
+            !trace <- deschedule (Blocked BlockedOnThrowTo) thread' simstate { threads = threads' }
+            return $ SimTrace time tid tlbl (EventThrowTo e tid')
+                   $ SimTrace time tid tlbl EventThrowToBlocked
+                   $ SimTrace time tid tlbl (EventDeschedule (Blocked BlockedOnThrowTo))
+                   $ trace
         else do
           -- The target thread has async exceptions unmasked, or is masked but
           -- is blocked (and all blocking operations are interruptible) then we
@@ -643,16 +655,34 @@ schedule !thread@Thread{
           -- be resolved if the thread terminates or if it leaves the exception
           -- handler (when restoring the masking state would trigger the any
           -- new pending async exception).
-          let adjustTarget t@Thread{ threadControl = ThreadControl _ ctl' } =
+          --
+          -- If the target thread is blocked in `throwTo`, interrupting it
+          -- cancels its `throwTo`: we drop its exception from the pending async
+          -- exceptions of its target, which might be this thread.
+          let adjustTarget :: Thread s a -> Thread s a
+              adjustTarget t@Thread{ threadControl = ThreadControl _ ctl' } =
                 t { threadControl = ThreadControl (Throw e) ctl'
                   , threadStatus  = ThreadRunning
                   }
+
+              cancelThrowTo :: Bool
+              cancelThrowTo = case Map.lookup tid' threads of
+                Just Thread { threadStatus = ThreadBlocked BlockedOnThrowTo }
+                  -> True
+                _ -> False
+
+              thread''
+                | cancelThrowTo = dropThrowToFrom tid' thread'
+                | otherwise     = thread'
+              simstate0
+                | cancelThrowTo = simstate { threads = Map.map (dropThrowToFrom tid') threads }
+                | otherwise     = simstate
               simstate'@SimState { threads = threads' }
-                         = snd (unblockThreads False [tid'] simstate)
+                         = snd (unblockThreads False [tid'] simstate0)
               threads''  = Map.adjust adjustTarget tid' threads'
               simstate'' = simstate' { threads = threads'' }
 
-          trace <- schedule thread' simstate''
+          trace <- schedule thread'' simstate''
           return $ SimTrace time tid tlbl (EventThrowTo e tid')
                  $ trace
 
@@ -776,6 +806,17 @@ schedulePendingThrowTo !thread@Thread {
              trace
 schedulePendingThrowTo _ _ =
     error "IOSim: schedulePendingThrowTo: no pending async exceptions"
+
+-- | Drop the pending async exceptions thrown by the given thread.
+--
+-- Used when a thread blocked in `throwTo` is interrupted: its `throwTo` is
+-- cancelled.  'BlockedOnThrowTo' does not record the target, but a thread is
+-- blocked in at most one `throwTo`, so it is safe to apply it to all threads.
+--
+dropThrowToFrom :: IOSimThreadId -> Thread s a -> Thread s a
+dropThrowToFrom tid t =
+    t { threadThrowTo = filter (\(_, Labelled tid' _) -> tid' /= tid)
+                               (threadThrowTo t) }
 
 -- When there is no current running thread but the runqueue is non-empty then
 -- schedule the next one to run.
@@ -1049,7 +1090,8 @@ unwindControlStack e = \thread timers ->
           Just (TimeoutException tmid') | tmid == tmid' ->
               (Right thread { threadControl = ThreadControl (k Nothing) ctl }, timers', reverse locks)
             -- Exception came from a different exception.  The cleanup of the
-            -- lock kills the assassin, if any.
+            -- lock kills the assassin, which retracts its pending exception, if
+            -- any.
           _ -> unwind thread
                       ctl
                       timers'
