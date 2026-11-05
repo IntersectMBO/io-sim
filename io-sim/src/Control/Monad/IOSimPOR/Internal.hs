@@ -1381,17 +1381,18 @@ forkTimeoutInterruptThreads timeoutExpired simState =
                     Nothing -> error ("IOSimPOR: internal error: unknown thread " ++ show tid)
               nextId   = threadNextTId t
               tid'     = childThreadId tid nextId
+
+              -- assassin thread
+              action :: IOSim s ()
+              action = do
+                mtid <- myThreadId
+                v2 <- atomically $ tryPutTMVar lock mtid
+                when v2 $
+                  throwTo tid (toException (TimeoutException tmid))
+
            in ( state { threads = Map.insert tid t { threadNextTId = succ nextId } threads }
               , ( Thread { threadId      = tid',
-                           threadControl =
-                            ThreadControl
-                              (runIOSim $ do
-                                 -- assassin thread
-                                 mtid <- myThreadId
-                                 v2 <- atomically $ tryPutTMVar lock mtid
-                                 when v2 $
-                                   throwTo tid (toException (TimeoutException tmid)))
-                              ForkFrame,
+                           threadControl = ThreadControl (runIOSim action) ForkFrame,
                            threadStatus  = ThreadRunning,
                            threadMasking = Unmasked,
                            threadThrowTo = [],
