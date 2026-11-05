@@ -945,40 +945,13 @@ deschedule Yield thread@Thread { threadId     = tid,
                           races    = races',
                           control  = control' }
 
-deschedule Interruptable thread@Thread {
-                           threadId      = tid,
-                           threadStep    = tstep,
-                           threadControl = ThreadControl _ ctl,
-                           threadMasking = Unmasked,
-                           threadThrowTo = (e, tid', vClock') : etids,
-                           threadLabel   = tlbl,
-                           threadVClock  = vClock,
-                           threadEffect  = effect
-                         }
-                        simstate@SimState{ curTime = time, threads } = do
-
-    let effect' = effect <> wakeupEffects unblocked
-        -- We're unmasking, but there are pending blocked async exceptions.
-        -- So immediately raise the exception and unblock the blocked thread
-        -- if possible.
-        thread' = thread { threadControl = ThreadControl (Throw e) ctl
-                         , threadMasking = MaskedInterruptible
-                         , threadThrowTo = etids
-                         , threadVClock  = vClock `leastUpperBoundVClock` vClock'
-                         , threadEffect  = effect'
-                         }
-        (unblocked,
-         simstate') = unblockThreads False vClock [l_labelled tid'] simstate
-    -- the thread is stepped when we Yield
-    !trace <- deschedule Yield thread' simstate'
-    return $ SimPORTrace time tid tstep tlbl (EventThrowToUnmasked tid')
-           $ SimPORTrace time tid tstep tlbl (EventEffect vClock effect')
-           -- TODO: step
-           $ traceMany [ (time, tid'', (-1), tlbl'', EventThrowToWakeup)
-                       | tid'' <- unblocked
-                       , let tlbl'' = lookupThreadLabel tid'' threads ]
-           $ SimPORTrace time tid tstep tlbl (EventDeschedule Yield)
-             trace
+deschedule Interruptable thread@Thread { threadMasking = Unmasked
+                                       , threadThrowTo = _ : _ }
+                         simstate =
+    -- We're unmasking, but there are pending blocked async exceptions.
+    -- So immediately raise the exception and unblock the blocked thread
+    -- if possible.
+    schedulePendingThrowToAndDeschedule thread simstate
 
 deschedule Interruptable thread@Thread{threadId     = tid,
                                        threadStep   = tstep,
@@ -1011,7 +984,7 @@ deschedule (Blocked _blockedReason) thread@Thread { threadId      = tid
     -- exceptions. So immediately raise the exception and unblock the blocked
     -- thread if possible.
     SimPORTrace time tid tstep tlbl (EventDeschedule Interruptable) <$>
-      deschedule Interruptable thread { threadMasking = Unmasked } simstate
+      schedulePendingThrowToAndDeschedule thread simstate
 
 deschedule (Blocked blockedReason) thread@Thread{ threadId     = tid,
                                                   threadStep   = tstep,
@@ -1068,6 +1041,59 @@ deschedule Sleep thread@Thread { threadId = tid , threadEffect = effect' }
     let runqueue' = insertThread thread runqueue
         threads'  = Map.insert tid thread threads in
     reschedule simstate { runqueue = runqueue', threads  = threads' }
+
+-- | Raise the first pending async exception of a thread, and unblock the
+-- thread which threw it.
+--
+schedulePendingThrowToAndDeschedule
+  :: Thread s a
+  -> SimState s a
+  -> ST s (SimTrace a)
+schedulePendingThrowToAndDeschedule thread@Thread {
+                      threadId      = tid,
+                      threadStep    = tstep,
+                      threadControl = ThreadControl _ ctl,
+                      threadMasking = maskst,
+                      threadThrowTo = (e, tid', vClock') : etids,
+                      threadLabel   = tlbl,
+                      threadVClock  = vClock,
+                      threadEffect  = effect
+                    }
+                    simstate@SimState{ curTime = time, threads } = do
+
+    let effect' = effect <> wakeupEffects unblocked
+        -- adding `MaskFrame` to restore the masking state back to `maskst` and
+        -- set the masking state to `MaskedInterruptible`.
+        --
+        -- This makes raising the exception atomic.  It stops `throwTo` from
+        -- another thread replacing the pending `Throw e` before that
+        -- `Throw` has run. Since the thread is not blocked, `willBlock` is
+        -- `True` and the thread that issues `throwTo` is blocked before it can
+        -- modify control frame.
+        --
+        -- This differs from IOSim case, since next we run `deschedule Yield`
+        -- which might pick another thread to run before we handle `Throw e`.
+        thread' = thread { threadControl = ThreadControl (Throw e)
+                                                         (MaskFrame Return maskst ctl)
+                         , threadMasking = MaskedInterruptible
+                         , threadThrowTo = etids
+                         , threadVClock  = vClock `leastUpperBoundVClock` vClock'
+                         , threadEffect  = effect'
+                         }
+        (unblocked,
+         simstate') = unblockThreads False vClock [l_labelled tid'] simstate
+    -- the thread is stepped when we Yield
+    !trace <- deschedule Yield thread' simstate'
+    return $ SimPORTrace time tid tstep tlbl (EventThrowToUnmasked tid')
+           $ SimPORTrace time tid tstep tlbl (EventEffect vClock effect')
+           -- TODO: step
+           $ traceMany [ (time, tid'', (-1), tlbl'', EventThrowToWakeup)
+                       | tid'' <- unblocked
+                       , let tlbl'' = lookupThreadLabel tid'' threads ]
+           $ SimPORTrace time tid tstep tlbl (EventDeschedule Yield)
+             trace
+schedulePendingThrowToAndDeschedule _ _ =
+    error "IOSimPOR: schedulePendingThrowToAndDeschedule: no pending async exceptions"
 
 
 -- Choose the next thread to run.

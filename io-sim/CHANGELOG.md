@@ -14,6 +14,7 @@
 * Fixed `timeout` in `IOSim` and `IOSimPOR`: if the action finished when the
   timeout fired, the timeout exception could be raised after `timeout`
   returned (#269).
+* Masking state is correctly restored after an async exception (both IOSim and  IOSimPOR).
 
 ## 1.11.0.0
 

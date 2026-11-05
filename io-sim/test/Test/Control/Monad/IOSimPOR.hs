@@ -144,6 +144,8 @@ tests =
           unit_timeout_raises_pending_exception_at_blocking_op_ST
       , testProperty "forwarded timeout exception, rethrown"
           unit_timeout_forwarded_exception_rethrown_ST
+      , testProperty "raised when timeout returns, on unmask"
+          unit_timeout_raises_pending_exception_on_unmask_ST
       ]
     , testGroup "STM reference semantics"
       [ testProperty "Reference vs Sim"   prop_stm_referenceSim
@@ -1276,3 +1278,8 @@ unit_timeout_forwarded_exception_rethrown_ST :: Property
 unit_timeout_forwarded_exception_rethrown_ST =
     once $ ioSimPORProperty False
          $ prop_timeout_forwarded_exception_rethrown
+
+unit_timeout_raises_pending_exception_on_unmask_ST :: Property
+unit_timeout_raises_pending_exception_on_unmask_ST =
+    once $ ioSimPORProperty False
+         $ prop_timeout_raises_pending_exception_on_unmask
