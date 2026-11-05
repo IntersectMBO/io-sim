@@ -652,11 +652,10 @@ schedule !thread@Thread{
 threadInterruptible :: Thread s a -> Bool
 threadInterruptible thread =
     case threadMasking thread of
-      Unmasked                   -> True
-      MaskedInterruptible
-        | isThreadBlocked thread -> True  -- blocking operations are interruptible
-        | otherwise              -> False
-      MaskedUninterruptible      -> False
+      Unmasked              -> True
+      -- blocking operations are interruptible
+      MaskedInterruptible   -> isThreadBlocked thread
+      MaskedUninterruptible -> False
 
 deschedule :: Deschedule -> Thread s a -> SimState s a -> ST s (SimTrace a)
 deschedule Yield !thread !simstate@SimState{runqueue, threads} =
