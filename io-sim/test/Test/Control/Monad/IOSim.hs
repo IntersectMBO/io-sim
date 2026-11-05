@@ -67,12 +67,18 @@ tests =
     , testProperty "async exceptions 1"     unit_timeouts_and_async_exceptions_1
     , testProperty "async exceptions 2"     unit_timeouts_and_async_exceptions_2
     , testProperty "async exceptions 3"     unit_timeouts_and_async_exceptions_3
+    , testProperty "assassin: pending throw"
+    $ forall_masking_states unit_timeout_assassin_pending_throw
     , testProperty "assassin: holds the lock"
     $ forall_masking_states unit_timeout_assassin_holds_lock
     , testProperty "assassin: frame unwound"
     $ forall_masking_states unit_timeout_assassin_frame_unwound
+    , testProperty "assassin: frame unwound, pending throw"
+    $ forall_masking_states unit_timeout_assassin_frame_unwound_pending_throw
     , testProperty "assassin: stacked frames unwound"
     $ forall_masking_states unit_timeout_assassin_stacked_frames_unwound
+    , testProperty "assassin: stacked timeouts fire"
+    $ forall_masking_states unit_timeout_assassin_stacked_timeouts_fire
     , testProperty "forwarded timeout exception"
                                             unit_timeout_forwarded_exception
     , testProperty "threadDelay and STM"    unit_threadDelay_and_stm
@@ -191,6 +197,14 @@ tests =
         unit_timeout_raises_pending_exception_on_unmask_IO
     , testProperty "raised when timeout returns, on unmask (IOSim)"
         unit_timeout_raises_pending_exception_on_unmask_ST
+    ]
+  , testGroup "throwTo cancellation"
+    [ testProperty "interrupted by a pending exception"
+        unit_throwTo_interrupted_by_pending_exception_ST
+    , testProperty "thrower killed"
+        unit_throwTo_thrower_killed_ST
+    , testProperty "thrower not woken"
+        unit_throwTo_cancelled_thrower_not_woken_ST
     ]
   , testGroup "STM reference semantics"
     [ testProperty "Reference vs IO"    prop_stm_referenceIO
@@ -749,7 +763,7 @@ unit_async_10 = once $
                       say "child 1"
                       yield
                       say "child 1 running"
-                    say "never 1"
+                    say "child 1 survived"
           tid2 <- forkIO $ do
                       threadDelay 1
                       say "child 2"
@@ -766,7 +780,9 @@ unit_async_10 = once $
           say "parent done"
           )
  ===
-   ["child 1", "child 2", "child 1 running", "parent done"]
+   -- child 2 is interrupted while blocked in `throwTo`, which cancels it, so
+   -- child 1 never receives its exception (as in GHC)
+   ["child 1", "child 2", "child 1 running", "child 1 survived", "parent done"]
 
 
 unit_async_11 = once $
@@ -777,7 +793,7 @@ unit_async_11 = once $
                       say "child 1"
                       yield
                       say "child 1 running"
-                    say "never 1"
+                    say "child 1 survived"
           tid2 <- forkIO $
                     -- Same as unit_async_10 but we run masked here
                     -- this is subtle: when the main thread throws the
@@ -798,7 +814,9 @@ unit_async_11 = once $
           say "parent done"
           )
  ===
-   ["child 1", "child 2", "child 1 running", "parent done"]
+   -- child 2 is interrupted while blocked in `throwTo`, which cancels it, so
+   -- child 1 never receives its exception (as in GHC)
+   ["child 1", "child 2", "child 1 running", "child 1 survived", "parent done"]
 
 
 unit_async_12 = once $
@@ -1222,6 +1240,35 @@ unit_timeouts_and_async_exceptions_3 = once $
       return $ property True
 
 
+-- | The assassin of a `timeout` throws while the timed thread is masked and
+-- runnable, so its exception is pending when the action finishes.  It must
+-- not be raised after `timeout` returns (#269).
+--
+-- The flag is set when the timeout fires.  The writer runs first (woken by its
+-- timer), then the assassin (forked at the same time, queued after it), then
+-- the timed thread (woken by the write).
+--
+unit_timeout_assassin_pending_throw :: MaskingState -> Property
+unit_timeout_assassin_pending_throw ms = once $
+    let trace = runSimTrace experiment in
+        counterexample (ppTrace_ trace)
+      . either (\e -> counterexample (show e) False) id
+      . traceResult False
+      $ trace
+  where
+    experiment :: IOSim s Property
+    experiment = do
+      flag <- newTVarIO False
+      _ <- forkIO $ threadDelay 1 >> atomically (writeTVar flag True)
+      r <- setMaskingState_ ms $
+             timeout 1 (atomically (readTVar flag >>= check))
+      return $ case ms of
+        -- the exception is delivered within the `timeout`
+        Unmasked -> r === Nothing
+        -- the exception is pending until the action finishes
+        _        -> r === Just ()
+
+
 -- | The assassin of a `timeout` takes the lock, but the action finishes
 -- before it throws.  The exception must not be raised after `timeout`
 -- returns (#269).
@@ -1271,6 +1318,27 @@ unit_timeout_assassin_frame_unwound ms = once $
       return (r === (Left DivideByZero :: Either ArithException (Maybe ())))
 
 
+-- | The assassin of a `timeout` throws while the timed thread is masked, then
+-- the action throws, and the exception unwinds through the `TimeoutFrame`.
+-- The pending exception must not be raised after the frame is left (#269).
+--
+unit_timeout_assassin_frame_unwound_pending_throw :: MaskingState -> Property
+unit_timeout_assassin_frame_unwound_pending_throw ms = once $
+    let trace = runSimTrace experiment in
+        counterexample (ppTrace_ trace)
+      . either (\e -> counterexample (show e) False) id
+      . traceResult False
+      $ trace
+  where
+    experiment :: IOSim s Property
+    experiment = do
+      r <- try $ setMaskingState_ ms $
+             timeout 1 (uninterruptibleMask_ (threadDelay 2 >> throwIO DivideByZero))
+      -- an interruptible point, a stale exception would be raised here
+      threadDelay 1
+      return (r === (Left DivideByZero :: Either ArithException (Maybe ())))
+
+
 -- | Like 'unit_timeout_assassin_frame_unwound', but the exception unwinds
 -- through two `TimeoutFrame`s, whose assassins are both forked (#269).
 --
@@ -1297,9 +1365,42 @@ unit_timeout_assassin_stacked_frames_unwound ms = once $
         _                    -> counterexample (show r) False
 
 
+-- | Two stacked timeouts fire at the same time.  The exception of one of them
+-- unwinds through the `TimeoutFrame` of the other one, whose assassin has
+-- already thrown.  Its exception must not be raised after the frame is left
+-- (#269).
+--
+-- Under `MaskedUninterruptible` neither exception can be delivered, so both
+-- frames are left normally.
+--
+unit_timeout_assassin_stacked_timeouts_fire :: MaskingState -> Property
+unit_timeout_assassin_stacked_timeouts_fire ms = once $
+    let trace = runSimTrace experiment in
+        counterexample (ppTrace_ trace)
+      . either (\e -> counterexample (show e) False) id
+      . traceResult False
+      $ trace
+  where
+    experiment :: IOSim s Property
+    experiment = do
+      r <- setMaskingState_ ms $
+             timeout 1 (timeout 1 (threadDelay 2))
+      -- interruptible points, a stale exception would be raised here
+      threadDelay 1
+      threadDelay 1
+      return $ case (ms, r) of
+        (MaskedUninterruptible, Just (Just ())) -> property True
+        (MaskedUninterruptible, _)              -> counterexample (show r) False
+        (_, Nothing)                            -> property True
+        (_, Just Nothing)                       -> property True
+        (_, Just (Just _))                      -> counterexample (show r) False
+
+
 -- | The timed thread catches the `TimeoutException` of its `timeout`, and
 -- another thread throws it back while the timed thread is masked within the
--- frame.  The forwarded exception must be raised after the frame is left.
+-- frame.  Leaving the frame must only retract the assassin's exception, not
+-- the forwarded one: otherwise the forwarding thread stays blocked in
+-- `throwTo` forever.
 --
 unit_timeout_forwarded_exception :: Property
 unit_timeout_forwarded_exception = once $
@@ -1740,3 +1841,19 @@ unit_timeout_raises_pending_exception_on_unmask_IO =
 unit_timeout_raises_pending_exception_on_unmask_ST :: Property
 unit_timeout_raises_pending_exception_on_unmask_ST =
     once $ ioSimProperty False prop_timeout_raises_pending_exception_on_unmask
+
+unit_throwTo_interrupted_by_pending_exception_ST :: Property
+unit_throwTo_interrupted_by_pending_exception_ST =
+    once $ ioSimProperty False prop_throwTo_interrupted_by_pending_exception
+
+unit_throwTo_thrower_killed_ST :: Property
+unit_throwTo_thrower_killed_ST =
+    once $ ioSimProperty False prop_throwTo_thrower_killed
+
+unit_throwTo_cancelled_thrower_not_woken_ST :: Property
+unit_throwTo_cancelled_thrower_not_woken_ST = once $
+    let trace = runSimTrace prop_throwTo_cancelled_thrower_not_woken in
+        counterexample (ppTrace_ trace)
+      . either (\e -> counterexample (show e) False) id
+      . traceResult False
+      $ trace
