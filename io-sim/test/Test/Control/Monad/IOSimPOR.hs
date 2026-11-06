@@ -17,6 +17,8 @@ import Data.Functor (($>))
 import Data.List qualified as List
 import Data.Map (Map)
 import Data.Map qualified as Map
+import Data.Set (Set)
+import Data.Set qualified as Set
 
 import System.Exit
 import System.IO.Error (ioeGetErrorString, isUserError)
@@ -66,6 +68,12 @@ tests =
       [ testProperty "wakeup"         unit_issue113_wakeup
       , testProperty "racy"           unit_issue113_racy
       , testProperty "nonDep"         unit_issue113_nonDep
+      ]
+    , testGroup "throwTo races with a wake-up"
+      [ testProperty "thrower runs first"
+          (unit_throwTo_races_with_wakeup False)
+      , testProperty "writer runs first"
+          (unit_throwTo_races_with_wakeup True)
       ]
     -- , testProperty "propPermutations" propPermutations
     ]
@@ -448,6 +456,67 @@ unit_issue113_nonDep =
                    Task [ThrowTo 1,WhenSet 1 1],
                    Task [ThrowTo 5],
                    Task [ThrowTo 1]]
+
+
+-- | A `throwTo` to a masked thread, which is blocked in STM, races with a write
+-- which wakes the thread up:
+--
+-- * if the exception is thrown first, the thread is blocked, hence
+--   interruptible, so the exception is raised at once and the transaction
+--   doesn't commit;
+-- * if the write is first, the thread is runnable, so the exception is pending
+--   until the thread unmasks, after the transaction committed.
+--
+-- IOSimPOR must explore both orders, whichever of them runs first.
+--
+unit_throwTo_races_with_wakeup :: Bool -- ^ whether the writer runs first
+                               -> Property
+unit_throwTo_races_with_wakeup writerFirst =
+    once $ exploreSimResults experiment $ \results ->
+      counterexample ("explored results: " ++ show (Set.toList results)) $
+      results === Set.fromList [False, True]
+  where
+    -- returns whether the blocked transaction committed
+    experiment :: IOSim s Bool
+    experiment = do
+      exploreRaces
+      flag      <- newTVarIO False
+      committed <- newTVarIO False
+      t <- async $ mask_ $ atomically $ do
+             readTVar flag >>= check
+             writeTVar committed True
+      let writer  = threadDelay 1 >> atomically (writeTVar flag True)
+          thrower = threadDelay 1 >> throwTo (asyncThreadId t) DivideByZero
+      -- at time 1, the thread forked last runs first, since it has the larger
+      -- thread id
+      ws <- if writerFirst
+              then do a <- async thrower
+                      w <- async writer
+                      return [a, w]
+              else do w <- async writer
+                      a <- async thrower
+                      return [w, a]
+      _ <- waitCatch t
+      traverse_ wait ws
+      readTVarIO committed
+
+
+-- | Explore the schedules of a simulation, and check the set of results of all
+-- the explored schedules.
+--
+exploreSimResults :: Ord a
+                  => (forall s. IOSim s a)
+                  -> (Set a -> Property)
+                  -> Property
+exploreSimResults sim k = ioProperty $ do
+    r <- newIORef Set.empty
+    return $
+           exploreSimTrace id sim
+             (\_ trace -> case traceResult False trace of
+                 Right a -> ioProperty (modifyIORef' r (Set.insert a) $> True)
+                 Left e  -> counterexample (show e) False)
+      -- `.&&.` checks all the explored schedules before the results
+      .&&. ioProperty (k <$> readIORef r)
 
 
 -- Testing propPermutations n should collect every permutation of [1..n] once only.

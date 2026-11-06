@@ -103,6 +103,10 @@ data Thread s a = Thread {
     threadStep    :: !Int,
     threadVClock  :: VectorClock,
     threadEffect  :: Effect,  -- in the current step
+    -- | The `TVar`s read by the STM transaction the thread is blocked on.  Only
+    -- valid while the thread is `BlockedOnSTM`: it is not cleared when the
+    -- thread wakes up.
+    threadWaitsOn :: !(Set (Labelled TVarId)),
     threadRacy    :: !Bool
   }
   deriving Show
@@ -444,9 +448,10 @@ schedule thread@Thread{
               (thread', eff)  = stepThread thread1
               control'        = advanceControl (threadStepId thread0) control
               races'          = updateRaces thread0 simstate
-          trace <- schedule thread' simstate{ races = races',
-                                              control = control',
-                                              timers = timers'' }
+          trace <- schedule thread'
+                            simstate{ races = races',
+                                      control = control',
+                                      timers = timers'' }
           return (SimPORTrace time tid tstep tlbl (EventThrow e) $
                   SimPORTrace time tid tstep tlbl (EventMask maskst') $
                   traceMany [ (time, tid, tstep, tlbl, EventMask MaskedUninterruptible)
@@ -473,7 +478,9 @@ schedule thread@Thread{
             -- blocked on it is woken up by `deschedule Terminated`.
             traverse_ closeTimeoutLock locks
             let terminated = Terminated
-            !trace <- deschedule terminated thread simstate { timers = timers'' }
+            !trace <- deschedule terminated
+                                 thread
+                                 simstate { timers = timers'' }
             return $ SimPORTrace time tid tstep tlbl (EventThrow e)
                    $ SimPORTrace time tid tstep tlbl (EventThreadUnhandled e)
                    $ SimPORTrace time tid tstep tlbl (EventDeschedule terminated)
@@ -694,6 +701,7 @@ schedule thread@Thread{
                               , threadVClock  = insertVClock tid' 0
                                               $ vClock
                               , threadEffect  = mempty
+                              , threadWaitsOn = Set.empty
                               , threadRacy    = threadRacy thread
                               }
             threads' = Map.insert tid' thread'' threads
@@ -765,9 +773,11 @@ schedule thread@Thread{
           vids <- traverse (\(SomeTVar tvar) -> labelledTVarId tvar) read
           vClockRead <- leastUpperBoundTVarVClocks read
           read' <- mapM someTVarToLabelled read
-          let effect' = effect <> readEffects read'
+          let readEffect = readEffects read'
+              effect' = effect <> readEffect
               thread' = thread { threadVClock  = vClock `leastUpperBoundVClock` vClockRead,
-                                 threadEffect  = effect' }
+                                 threadEffect  = effect',
+                                 threadWaitsOn = effectReads readEffect }
           !trace <- deschedule (Blocked BlockedOnSTM) thread' simstate
           return $ SimPORTrace time tid tstep tlbl (EventTxBlocked vids (Just effect'))
                  $ SimPORTrace time tid tstep tlbl (EventDeschedule (Blocked BlockedOnSTM))
@@ -837,7 +847,8 @@ schedule thread@Thread{
       ThrowTo e tid' k -> do
         let thread'    = thread { threadControl = ThreadControl k ctl,
                                   threadEffect  = effect <> throwToEffect tid'
-                                                         <> wakeUpEffect,
+                                                         <> wakeUpEffect
+                                                         <> interruptEffect,
                                   threadVClock  = vClock `leastUpperBoundVClock` vClockTgt
                                 }
             (vClockTgt,
@@ -846,6 +857,19 @@ schedule thread@Thread{
                            if isThreadBlocked t then wakeupEffects [tid'] else mempty,
                            not (threadInterruptible t || isThreadDone t))
               where Just t = Map.lookup tid' threads
+
+            -- If the exception interrupts a blocked transaction, this step
+            -- races with writes to the `TVar`s the transaction waits on: if
+            -- one of them wakes the thread up first, the exception finds it
+            -- runnable, and if it is masked, not interruptible.
+            interruptEffect
+              | not willBlock
+              , Just Thread { threadStatus  = ThreadBlocked BlockedOnSTM
+                            , threadWaitsOn = tvars }
+                  <- Map.lookup tid' threads
+              = mempty { effectReads = tvars }
+              | otherwise
+              = mempty
 
         if willBlock
           then case threadThrowTo thread of
@@ -1416,6 +1440,7 @@ forkTimeoutInterruptThreads timeoutExpired simState =
                            threadVClock  = insertVClock tid' 0
                                          $ threadVClock t,
                            threadEffect  = mempty,
+                           threadWaitsOn = Set.empty,
                            threadRacy    = threadRacy t
                          }
                 , lock
@@ -1592,6 +1617,7 @@ controlSimTraceST limit control mainAction =
         threadStep    = 0,
         threadVClock  = insertVClock (ThreadId []) 0 bottomVClock,
         threadEffect  = mempty,
+        threadWaitsOn = Set.empty,
         threadRacy    = False
       }
 
