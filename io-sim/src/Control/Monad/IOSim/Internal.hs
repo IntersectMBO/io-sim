@@ -659,9 +659,17 @@ schedule !thread@Thread{
           -- If the target thread is blocked in `throwTo`, interrupting it
           -- cancels its `throwTo`: we drop its exception from the pending async
           -- exceptions of its target, which might be this thread.
+          --
+          -- The target thread is also `MaskedInterruptible`, to make
+          -- subsequent `throwTo` to that thread blocking, otherwise they will
+          -- again land in this branch and overwrite a pending throw.  When the
+          -- `e` is thrown, the masking state is restored.
           let adjustTarget :: Thread s a -> Thread s a
-              adjustTarget t@Thread{ threadControl = ThreadControl _ ctl' } =
-                t { threadControl = ThreadControl (Throw e) ctl'
+              adjustTarget t@Thread{ threadControl = ThreadControl _ ctl',
+                                     threadMasking = maskst' } =
+                t { threadControl = ThreadControl (Throw e)
+                                                  (MaskFrame Return maskst' ctl')
+                  , threadMasking = MaskedInterruptible
                   , threadStatus  = ThreadRunning
                   }
 

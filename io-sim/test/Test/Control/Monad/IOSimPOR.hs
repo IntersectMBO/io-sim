@@ -147,6 +147,10 @@ tests =
       , testProperty "8"  unit_async_8
       , testProperty "9"  unit_async_9
       ]
+    , testGroup "pending async exceptions: throwTo"
+      [ testProperty "not overwritten by throwTo"
+          unit_throwTo_does_not_overwrite_pending_exception_ST
+      ]
     , testGroup "pending async exceptions"
       [ testProperty "raised when timeout returns, at blocking op"
           unit_timeout_raises_pending_exception_at_blocking_op_ST
@@ -1078,10 +1082,10 @@ prop_stacked_timeouts timeout0 timeout1 actionDuration =
               | actionDuration < min timeout0 timeout1
               = Just (Just ())
 
-              | timeout0 < timeout1
+              | timeout0 <= timeout1
               = Nothing
 
-              | otherwise -- i.e. timeout0 >= timeout1
+              | otherwise -- i.e. timeout0 > timeout1
               = Just Nothing
 
 unit_registerDelay_threadDelay :: Property
@@ -1376,6 +1380,11 @@ unit_timeout_stacked_pending_exception_ST :: Property
 unit_timeout_stacked_pending_exception_ST =
     once $ ioSimPORProperty True
          $ prop_timeout_stacked_pending_exception
+
+unit_throwTo_does_not_overwrite_pending_exception_ST :: Property
+unit_throwTo_does_not_overwrite_pending_exception_ST =
+    once $ ioSimPORProperty False
+         $ prop_throwTo_does_not_overwrite_pending_exception
 
 unit_timeout_forwarded_exception_rethrown_ST :: Property
 unit_timeout_forwarded_exception_rethrown_ST =

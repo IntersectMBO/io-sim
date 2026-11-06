@@ -184,11 +184,21 @@ tests =
     , testProperty "15" unit_async_15
     , testProperty "16" unit_async_16
     ]
+  , testGroup "pending async exceptions: throwTo"
+    [ testProperty "not overwritten by throwTo (IO)"
+        unit_throwTo_does_not_overwrite_pending_exception_IO
+    , testProperty "not overwritten by throwTo (IOSim)"
+        unit_throwTo_does_not_overwrite_pending_exception_ST
+    ]
   , testGroup "pending async exceptions"
     [ testProperty "raised when timeout returns, at blocking op (IO)"
         unit_timeout_raises_pending_exception_at_blocking_op_IO
     , testProperty "raised when timeout returns, at blocking op (IOSim)"
         unit_timeout_raises_pending_exception_at_blocking_op_ST
+    , testProperty "stacked timeouts: inner assassin not leaked (IO)"
+        unit_timeout_stacked_pending_exception_IO
+    , testProperty "stacked timeouts: inner assassin not leaked (IOSim)"
+        unit_timeout_stacked_pending_exception_ST
     , testProperty "forwarded timeout exception, rethrown (IO)"
         unit_timeout_forwarded_exception_rethrown_IO
     , testProperty "forwarded timeout exception, rethrown (IOSim)"
@@ -1128,10 +1138,10 @@ prop_stacked_timeouts timeout0 timeout1 actionDuration =
               | actionDuration <= min timeout0 timeout1
               = Just (Just ())
 
-              | timeout0 < timeout1
+              | timeout0 <= timeout1
               = Nothing
 
-              | otherwise -- i.e. timeout0 >= timeout1
+              | otherwise -- i.e. timeout0 > timeout1
               = Just Nothing
 
 
@@ -1825,6 +1835,25 @@ unit_timeout_raises_pending_exception_at_blocking_op_ST :: Property
 unit_timeout_raises_pending_exception_at_blocking_op_ST =
     once $ ioSimProperty False
          $ prop_timeout_raises_pending_exception_at_blocking_op
+
+unit_timeout_stacked_pending_exception_IO :: Property
+unit_timeout_stacked_pending_exception_IO =
+    once $ ioProperty prop_timeout_stacked_pending_exception
+
+-- | The simulation also fails if any thread, e.g. the inner assassin, is
+-- still running or blocked when the main thread returns.
+--
+unit_timeout_stacked_pending_exception_ST :: Property
+unit_timeout_stacked_pending_exception_ST =
+    once $ ioSimProperty True prop_timeout_stacked_pending_exception
+
+unit_throwTo_does_not_overwrite_pending_exception_IO :: Property
+unit_throwTo_does_not_overwrite_pending_exception_IO =
+    once $ ioProperty prop_throwTo_does_not_overwrite_pending_exception
+
+unit_throwTo_does_not_overwrite_pending_exception_ST :: Property
+unit_throwTo_does_not_overwrite_pending_exception_ST =
+    once $ ioSimProperty False prop_throwTo_does_not_overwrite_pending_exception
 
 unit_timeout_forwarded_exception_rethrown_IO :: Property
 unit_timeout_forwarded_exception_rethrown_IO =
