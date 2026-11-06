@@ -1056,6 +1056,8 @@ prop_timeouts times = exploreSimTrace id experiment $ \_ trace ->
                ("too many failures: " ++ show numFailures ++ " ≰ " ++ show maxFailures)
                (numFailures <= maxFailures)
 
+data TimeoutResult = OuterTimeout | InnerTimeout | Result
+  deriving (Eq, Ord, Show)
 
 prop_stacked_timeouts :: DiffTime
                       -> DiffTime
@@ -1064,29 +1066,68 @@ prop_stacked_timeouts :: DiffTime
 prop_stacked_timeouts timeout0 timeout1 actionDuration =
     exploreSimTrace id experiment $ \_ trace ->
       case traceResult False trace of
-        Right result -> result === predicted
+        Right result -> counterexample ("predicted: " ++ show predicted)
+                      $ result === expected
+                   .&&. counterexample "the expected result is not predicted"
+                                       (expected `elem` predicted)
         Left e       -> counterexample (show e) False
   where
-    experiment :: IOSim s (Maybe (Maybe ()))
+    experiment :: IOSim s TimeoutResult
     experiment = exploreRaces
-              >> timeout timeout0 (timeout timeout1 (threadDelay actionDuration))
+              >> fn <$> timeout timeout0 (timeout timeout1 (threadDelay actionDuration))
+      where
+        fn Nothing         = OuterTimeout
+        fn (Just Nothing)  = InnerTimeout
+        fn (Just (Just _)) = Result
 
+    predicted :: [TimeoutResult]
     predicted | timeout0 == 0
-              = Nothing
+              = [OuterTimeout]
 
               | timeout1 == 0
-              = Just Nothing
+              = [InnerTimeout]
 
-              -- This differs from `IOSim` case; `IOSimPOR` is using
-              -- different scheduler.
               | actionDuration < min timeout0 timeout1
-              = Just (Just ())
+              = [Result]
 
-              | timeout0 <= timeout1
-              = Nothing
+              -- The action finishes when a timeout fires, either of them can
+              -- win.  This differs from `IOSim` case; `IOSimPOR` is using
+              -- different scheduler.
+              | actionDuration == min timeout0 timeout1
+              = Result : [ OuterTimeout | timeout0 == actionDuration ]
+                      ++ [ InnerTimeout | timeout1 == actionDuration ]
+
+              | timeout0 < timeout1
+              = [OuterTimeout]
+
+              -- both timeouts fire at the same time, either of them can win
+              | timeout0 == timeout1
+              = [OuterTimeout, InnerTimeout]
 
               | otherwise -- i.e. timeout0 > timeout1
-              = Just Nothing
+              = [InnerTimeout]
+
+    -- The result of the only schedule which `IOSimPOR` explores.  The
+    -- timeouts run in the main thread, whose thread id is not racy, so its
+    -- steps do not start races and a tie is decided by the default schedule:
+    -- the action wins a tie with a timeout, and the outer timeout wins a tie
+    -- with the inner one.  Checking that all the `predicted` results are
+    -- explored needs `IOSimPOR` to explore these races.
+    expected :: TimeoutResult
+    expected | timeout0 == 0
+             = OuterTimeout
+
+             | timeout1 == 0
+             = InnerTimeout
+
+             | actionDuration <= min timeout0 timeout1
+             = Result
+
+             | timeout0 <= timeout1
+             = OuterTimeout
+
+             | otherwise
+             = InnerTimeout
 
 unit_registerDelay_threadDelay :: Property
 unit_registerDelay_threadDelay =
