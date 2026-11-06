@@ -122,11 +122,10 @@ threadStepId Thread{ threadId, threadStep } = (threadId, threadStep)
 
 isRacyThreadId :: IOSimThreadId -> Bool
 isRacyThreadId (RacyThreadId _) = True
-isRacyThreadId _                = True
+isRacyThreadId (ThreadId _)     = False
 
 isNotRacyThreadId :: IOSimThreadId -> Bool
-isNotRacyThreadId (ThreadId _) = True
-isNotRacyThreadId _            = False
+isNotRacyThreadId = not . isRacyThreadId
 
 bottomVClock :: VectorClock
 bottomVClock = VectorClock Map.empty
