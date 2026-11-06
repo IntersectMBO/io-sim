@@ -1117,6 +1117,9 @@ prop_timeouts times =
                (numFailures <= maxFailures)
 
 
+data TimeoutResult = OuterTimeout | InnerTimeout | Result
+  deriving (Eq, Ord, Show)
+
 prop_stacked_timeouts :: TimeoutDuration
                       -> TimeoutDuration
                       -> ActionDuration
@@ -1126,23 +1129,27 @@ prop_stacked_timeouts timeout0 timeout1 actionDuration =
     counterexample (ppTrace_ trace) $
     either (\e -> counterexample (show e) False) (=== predicted) (traceResult False trace)
   where
-    experiment :: IOSim s (Maybe (Maybe ()))
-    experiment = timeout timeout0 (timeout timeout1 (threadDelay actionDuration))
+    experiment :: IOSim s TimeoutResult
+    experiment = fn <$> timeout timeout0 (timeout timeout1 (threadDelay actionDuration))
+      where
+        fn Nothing         = OuterTimeout
+        fn (Just Nothing)  = InnerTimeout
+        fn (Just (Just _)) = Result
 
     predicted | timeout0 == 0
-              = Nothing
+              = OuterTimeout
 
               | timeout1 == 0
-              = Just Nothing
+              = InnerTimeout
 
               | actionDuration <= min timeout0 timeout1
-              = Just (Just ())
+              = Result
 
               | timeout0 <= timeout1
-              = Nothing
+              = OuterTimeout
 
               | otherwise -- i.e. timeout0 > timeout1
-              = Just Nothing
+              = InnerTimeout
 
 
 -- | Check that `discardAfter` works as expected.
