@@ -564,6 +564,38 @@ selectTraceSay  _                                         = []
 
 
 --
+-- `throwTo` and pending async exceptions
+--
+
+-- | A `throwTo` must not replace an async exception which was raised in its
+-- target, but which the target has not run yet.
+--
+-- `killThread` is synchronous: `t` dies of `ThreadKilled` (which
+-- @'try' \@ErrorCall@ does not catch), and the second `throwTo` finds it
+-- dead.
+--
+prop_throwTo_does_not_overwrite_pending_exception
+  :: forall m. ( MonadDelay m
+               , MonadFork  m
+               , MonadMask  m
+               , MonadSTM   m
+               )
+  => m Property
+prop_throwTo_does_not_overwrite_pending_exception = do
+    res <- newTVarIO Nothing
+    t <- forkIO $ do
+           r <- try @_ @ErrorCall (threadDelay 1)
+           atomically (writeTVar res (Just r))
+    -- let `t` block in `threadDelay`
+    threadDelay 0.01
+    killThread t
+    throwTo t (ErrorCall "second")
+    threadDelay 0.1
+    r <- readTVarIO res
+    return $ counterexample "`t` survived" $ r === Nothing
+
+
+--
 -- Pending async exceptions
 --
 
