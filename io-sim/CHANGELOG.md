@@ -15,6 +15,10 @@
   timeout fired, the timeout exception could be raised after `timeout`
   returned (#269).
 * Masking state is correctly restored after an async exception (both IOSim and  IOSimPOR).
+* `IOSimPOR` explores the race between a `throwTo` and a step which wakes up
+  its target, e.g. by writing a `TVar` the target is blocked on.  This can
+  multiply the number of explored schedules, e.g. when timeouts fire while
+  their actions wait in STM transactions which other threads wake up.
 
 ## 1.11.0.0
 
