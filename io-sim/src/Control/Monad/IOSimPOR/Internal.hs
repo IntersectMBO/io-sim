@@ -563,7 +563,9 @@ schedule thread@Thread{
                                                  (TimeoutFrame nextTmid lock k ctl)
                                 }
         trace <- deschedule Yield thread' simstate { timers   = timers'
-                                                    , nextTmid = succ nextTmid }
+                                                   , nextTmid = succ nextTmid
+                                                   , nextVid  = succ nextVid
+                                                   }
         return (SimPORTrace time tid tstep tlbl (EventTimeoutCreated nextTmid tid expiry) trace)
 
       UnregisterTimeout tmid k -> do
