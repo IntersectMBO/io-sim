@@ -1206,8 +1206,8 @@ ioSimPORProperty strict iosim =
 -- runnable, so its exception is pending when the action finishes.  It must
 -- not be raised after `timeout` returns (#269).
 --
--- `timeout` runs in a forked thread, so that the steps of its assassin are
--- racy as well.
+-- `timeout` runs in a forked thread, so that the steps of the timed thread
+-- are racy: the steps of the main thread never start a race.
 --
 unit_timeout_assassin_pending_throw :: MaskingState -> Property
 unit_timeout_assassin_pending_throw ms =
@@ -1264,8 +1264,8 @@ unit_timeout_forwarded_exception =
 -- before it throws.  The exception must not be raised after `timeout`
 -- returns (#269).
 --
--- `timeout` runs in a forked thread, so that the steps of its assassin are
--- racy as well.
+-- `timeout` runs in a forked thread, so that the steps of the timed thread
+-- are racy: the steps of the main thread never start a race.
 --
 unit_timeout_assassin_holds_lock :: MaskingState -> Property
 unit_timeout_assassin_holds_lock ms =
@@ -1284,8 +1284,8 @@ unit_timeout_assassin_holds_lock ms =
 -- `TimeoutFrame` and is caught outside of it.  The assassin must not throw
 -- after the frame is left, and its exception must not be pending (#269).
 --
--- `timeout` runs in a forked thread, so that the steps of its assassin are
--- racy as well.
+-- `timeout` runs in a forked thread, so that the steps of the timed thread
+-- are racy: the steps of the main thread never start a race.
 --
 unit_timeout_assassin_frame_unwound :: MaskingState -> Property
 unit_timeout_assassin_frame_unwound ms =

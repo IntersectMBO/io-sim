@@ -11,7 +11,6 @@ module Control.Monad.IOSim.CommonTypes
   , StepId
   , ppStepId
   , childThreadId
-  , setRacyThread
   , TVarId (..)
   , VarId
   , TimeoutId (..)
@@ -74,13 +73,10 @@ ppIOSimThreadId :: IOSimThreadId -> String
 ppIOSimThreadId (RacyThreadId as) = "Thread {"++ intercalate "," (map show as) ++"}"
 ppIOSimThreadId     (ThreadId as) = "Thread " ++ show as
 
-childThreadId :: IOSimThreadId -> Int -> IOSimThreadId
-childThreadId (RacyThreadId is) i = RacyThreadId (is ++ [i])
-childThreadId (ThreadId     is) i = ThreadId     (is ++ [i])
-
-setRacyThread :: IOSimThreadId -> IOSimThreadId
-setRacyThread (ThreadId is)      = RacyThreadId is
-setRacyThread tid@RacyThreadId{} = tid
+childThreadId :: Bool -> IOSimThreadId -> Int -> IOSimThreadId
+childThreadId _     (RacyThreadId is) i = RacyThreadId (is ++ [i])
+childThreadId False (ThreadId     is) i = ThreadId     (is ++ [i])
+childThreadId True  (ThreadId     is) i = RacyThreadId (is ++ [i])
 
 -- | Execution step in `IOSimPOR` is identified by the thread id and
 -- a monotonically increasing number (thread specific).

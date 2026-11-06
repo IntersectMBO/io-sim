@@ -508,7 +508,7 @@ schedule !thread@Thread{
 
     Fork a k -> do
       let !nextId   = threadNextTId thread
-          !tid'     = childThreadId tid nextId
+          !tid'     = childThreadId False tid nextId
           !thread'  = thread { threadControl = ThreadControl (k tid') ctl
                              , threadNextTId = succ nextId }
           !thread'' = Thread { threadId      = tid'
@@ -994,7 +994,7 @@ forkTimeoutInterruptThreads timeoutExpired simState =
                   throwTo tid (toException (TimeoutException tmid))
 
           in ( state { threads = Map.insert tid t { threadNextTId = succ nextId } threads }
-             , ( Thread { threadId      = childThreadId tid nextId,
+             , ( Thread { threadId      = childThreadId False tid nextId,
                           threadControl = ThreadControl (runIOSim action) ForkFrame,
                           threadStatus  = ThreadRunning,
                           threadMasking = Unmasked,

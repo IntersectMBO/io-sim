@@ -674,9 +674,8 @@ schedule thread@Thread{
 
       Fork a k -> do
         let nextTId = threadNextTId thread
-            tid' | threadRacy thread = setRacyThread $ childThreadId tid nextTId
-                 | otherwise         = childThreadId tid nextTId
-            thread'  = thread { threadControl = ThreadControl (k tid') ctl,
+            tid'    = childThreadId (threadRacy thread) tid nextTId
+            thread' = thread { threadControl = ThreadControl (k tid') ctl,
                                 threadNextTId = nextTId + 1,
                                 threadEffect  = effect
                                              <> forkEffect tid'
@@ -1393,7 +1392,7 @@ forkTimeoutInterruptThreads timeoutExpired simState =
                     Just t' -> t'
                     Nothing -> error ("IOSimPOR: internal error: unknown thread " ++ show tid)
               nextId   = threadNextTId t
-              tid'     = childThreadId tid nextId
+              tid'     = childThreadId (threadRacy t) tid nextId
 
               -- assassin thread
               action :: IOSim s ()
