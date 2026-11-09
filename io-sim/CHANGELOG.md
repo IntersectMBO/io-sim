@@ -15,6 +15,34 @@
   timeout fired, the timeout exception could be raised after `timeout`
   returned (#269).
 * Masking state is correctly restored after an async exception (both IOSim and  IOSimPOR).
+* A thread blocked in `throwTo` which is interrupted, e.g. by `killThread`,
+  cancels its `throwTo`, as in GHC (both `IOSim` and `IOSimPOR`).  Before,
+  the target still received the exception when it unmasked, and the
+  interrupted thread was woken up then, even out of an unrelated blocking
+  call.
+* A `throwTo` which blocks is an interruptible point, as in GHC: if the
+  thread has pending async exceptions, and is not `MaskedUninterruptible`,
+  one of them is raised, and the target does not receive the exception (both
+  `IOSim` and `IOSimPOR`).
+* A `throwTo` no longer replaces an async exception which was raised in its
+  target, but which the target has not run yet:
+  `throwTo tid e1 >> throwTo tid e2` raised only `e2`.  The second `throwTo`
+  now blocks until the target can receive it, as in GHC (both `IOSim` and
+  `IOSimPOR`).  In `IOSim`, when nested `timeout`s fire at the same time, the
+  outer one now wins.
+* `IOSimPOR`: `cancelTimeout`, and the cancel action returned by
+  `registerDelayCancellable`, only wake up threads blocked in STM, as in
+  `IOSim`.  Before, they also woke up a thread which had waited for the
+  timeout in an STM transaction, but was blocked in something else by then,
+  e.g. in a `throwTo`, which then returned before the exception was
+  delivered.
+* `IOSimPOR`: the threads which `timeout` forks to throw its exception are
+  racy if the timed thread is, as other threads forked by a racy thread are:
+  races with their steps are explored, and traces show them as
+  `RacyThreadId`s.  In a thread which called `exploreRaces`, e.g. the main
+  thread, they now have a lower priority than the timed thread, so the
+  default schedule can end differently when the action finishes at the same
+  time as the timeout fires.
 * `IOSimPOR` explores the race between a `throwTo` and a step which wakes up
   its target, e.g. by writing a `TVar` the target is blocked on.  This can
   multiply the number of explored schedules, e.g. when timeouts fire while
