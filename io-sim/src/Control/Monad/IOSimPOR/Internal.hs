@@ -661,7 +661,7 @@ schedule thread@Thread{
                              , threadEffect  = effect'
                              }
             (unblocked,
-             simstate') = unblockThreads False vClock wakeup simstate
+             simstate') = unblockThreads True vClock wakeup simstate
         modifySTRef (tvarVClock tvar)  (leastUpperBoundVClock vClock)
         !trace <- deschedule Yield thread' simstate' { timers = timers' }
         return $ SimPORTrace time tid tstep tlbl (EventTimerCancelled tmid)
