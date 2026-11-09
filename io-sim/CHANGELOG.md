@@ -47,6 +47,12 @@
   its target, e.g. by writing a `TVar` the target is blocked on.  This can
   multiply the number of explored schedules, e.g. when timeouts fire while
   their actions wait in STM transactions which other threads wake up.
+* `IOSimPOR` explores the race between interrupting a thread blocked in
+  `throwTo`, which cancels its `throwTo`, and the target checking its pending
+  async exceptions, when it unmasks, blocks while interruptible, or
+  terminates: if the target is first, the exception is raised (or the thrower
+  is woken up, if the target terminates).  Before, if the interrupt ran first,
+  the other order was never explored.
 
 ## 1.11.0.0
 

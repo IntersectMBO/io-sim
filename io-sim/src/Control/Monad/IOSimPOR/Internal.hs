@@ -102,6 +102,11 @@ data Thread s a = Thread {
     threadNextTId :: !Int,
     threadStep    :: !Int,
     threadVClock  :: VectorClock,
+    -- | The vector clock of the steps which cancelled any of the pending async
+    -- exceptions of the thread since it last checked them.  It is joined
+    -- into `threadVClock` when the thread checks them, see
+    -- `checkPendingThrowTo`.
+    threadPendingVClock :: !VectorClock,
     threadEffect  :: Effect,  -- in the current step
     -- | The `TVar`s read by the STM transaction the thread is blocked on.  Only
     -- valid while the thread is `BlockedOnSTM`: it is not cleared when the
@@ -700,6 +705,7 @@ schedule thread@Thread{
                               , threadStep    = 0
                               , threadVClock  = insertVClock tid' 0
                                               $ vClock
+                              , threadPendingVClock = bottomVClock
                               , threadEffect  = mempty
                               , threadWaitsOn = Set.empty
                               , threadRacy    = threadRacy thread
@@ -935,7 +941,9 @@ schedule thread@Thread{
                   _ -> False
 
                 -- the other threads whose pending async exceptions change:
-                -- this step races with their steps
+                -- this step races with their next check of pending async
+                -- exceptions, which decides if the exception is raised (or if
+                -- they wake up the thrower when they terminate)
                 cancelledTargets :: [IOSimThreadId]
                 cancelledTargets =
                   [ threadId t
@@ -949,17 +957,20 @@ schedule thread@Thread{
                 thread''
                   | cancelThrowTo = (dropThrowToFrom tid' thread')
                                       { threadEffect = threadEffect thread'
-                                                    <> foldMap throwToEffect cancelledTargets
+                                                    <> cancelsPendingEffects cancelledTargets
                                       }
                   | otherwise     = thread'
 
-                -- the targets whose pending async exceptions change happen
-                -- after this step
+                -- the next check of pending async exceptions of the targets
+                -- happens after this step, but not their steps before it: they
+                -- do not depend on this step, and might be reordered with it,
+                -- see `checkPendingThrowTo`
                 cancelThrowToAt :: Thread s a -> Thread s a
                 cancelThrowToAt t
                   | threadId t `elem` cancelledTargets
                   = (dropThrowToFrom tid' t)
-                      { threadVClock = threadVClock t `leastUpperBoundVClock` vClock }
+                      { threadPendingVClock = threadPendingVClock t
+                                              `leastUpperBoundVClock` vClock }
                   | otherwise
                   = t
 
@@ -1049,16 +1060,20 @@ deschedule Interruptable thread@Thread { threadMasking = Unmasked
     -- if possible.
     schedulePendingThrowToAndDeschedule thread simstate
 
-deschedule Interruptable thread@Thread{threadId     = tid,
-                                       threadStep   = tstep,
-                                       threadLabel  = tlbl,
-                                       threadVClock = vClock}
+deschedule Interruptable thread0@Thread{threadId      = tid,
+                                        threadStep    = tstep,
+                                        threadLabel   = tlbl,
+                                        threadMasking = maskst}
                          simstate@SimState{ control,
                                             curTime = time } =
     -- Either masked or unmasked but no pending async exceptions.
     -- Either way, just carry on.
     -- Record a step, though, in case on replay there is an async exception.
-    let (thread', eff) = stepThread thread
+    let -- if it is unmasked, the thread checked its pending async exceptions
+        thread | maskst == Unmasked = checkPendingThrowTo thread0
+               | otherwise          = thread0
+        vClock         = threadVClock thread
+        (thread', eff) = stepThread thread
         races' = updateRaces thread simstate in
 
     SimPORTrace time tid tstep tlbl (EventEffect vClock eff) .
@@ -1082,14 +1097,20 @@ deschedule (Blocked _blockedReason) thread@Thread { threadId      = tid
     SimPORTrace time tid tstep tlbl (EventDeschedule Interruptable) <$>
       schedulePendingThrowToAndDeschedule thread simstate
 
-deschedule (Blocked blockedReason) thread@Thread{ threadId     = tid,
-                                                  threadStep   = tstep,
-                                                  threadLabel  = tlbl,
-                                                  threadVClock = vClock}
+deschedule (Blocked blockedReason) thread@Thread{ threadId      = tid,
+                                                  threadStep    = tstep,
+                                                  threadLabel   = tlbl,
+                                                  threadMasking = maskst }
                                    simstate@SimState{ threads,
                                                       curTime = time,
                                                       control } =
-    let thread1        = thread { threadStatus = ThreadBlocked blockedReason }
+    let thread0        = thread { threadStatus = ThreadBlocked blockedReason }
+        -- a blocking operation is an interruptible point, unless the thread is
+        -- `MaskedUninterruptible`: the thread checked its pending async
+        -- exceptions (there are none, see the previous clause)
+        thread1 | maskst /= MaskedUninterruptible = checkPendingThrowTo thread0
+                | otherwise                       = thread0
+        vClock         = threadVClock thread1
         (thread', eff) = stepThread thread1
         threads'       = Map.insert (threadId thread') thread' threads
         races'         = updateRaces thread1 simstate in
@@ -1100,12 +1121,15 @@ deschedule (Blocked blockedReason) thread@Thread{ threadId     = tid,
                           races   = races',
                           control = advanceControl (threadStepId thread1) control }
 
-deschedule Terminated thread@Thread { threadId = tid, threadStep = tstep, threadLabel = tlbl,
-                                      threadVClock = vClock, threadEffect = effect }
+deschedule Terminated thread0@Thread { threadId = tid, threadStep = tstep, threadLabel = tlbl }
                                simstate@SimState{ curTime = time, control } = do
     -- This thread is done. If there are other threads blocked in a
-    -- ThrowTo targeted at this thread then we can wake them up now.
-    let wakeup         = map (\(_,tid',_) -> l_labelled tid') (reverse (threadThrowTo thread))
+    -- ThrowTo targeted at this thread then we can wake them up now: the thread
+    -- checked its pending async exceptions.
+    let thread         = checkPendingThrowTo thread0
+        vClock         = threadVClock thread
+        effect         = threadEffect thread
+        wakeup         = map (\(_,tid',_) -> l_labelled tid') (reverse (threadThrowTo thread))
         (unblocked,
          simstate'@SimState{threads}) =
                       unblockThreads False vClock wakeup simstate
@@ -1139,24 +1163,25 @@ deschedule Sleep thread@Thread { threadId = tid , threadEffect = effect' }
     reschedule simstate { runqueue = runqueue', threads  = threads' }
 
 -- | Raise the first pending async exception of a thread, and unblock the
--- thread which threw it.
+-- thread which threw it.  The thread checked its pending async exceptions.
 --
 schedulePendingThrowToAndDeschedule
   :: Thread s a
   -> SimState s a
   -> ST s (SimTrace a)
-schedulePendingThrowToAndDeschedule thread@Thread {
-                      threadId      = tid,
-                      threadStep    = tstep,
-                      threadControl = ThreadControl _ ctl,
-                      threadMasking = maskst,
-                      threadThrowTo = (e, tid', vClock') : etids,
-                      threadLabel   = tlbl,
-                      threadVClock  = vClock,
-                      threadEffect  = effect
-                    }
-                    simstate@SimState{ curTime = time, threads } = do
-
+schedulePendingThrowToAndDeschedule thread0
+                                    simstate@SimState{ curTime = time, threads }
+  | thread@Thread {
+      threadId      = tid,
+      threadStep    = tstep,
+      threadControl = ThreadControl _ ctl,
+      threadMasking = maskst,
+      threadThrowTo = (e, tid', vClock') : etids,
+      threadLabel   = tlbl,
+      threadVClock  = vClock,
+      threadEffect  = effect
+    } <- checkPendingThrowTo thread0
+  = do
     let effect' = effect <> wakeupEffects unblocked
         -- adding `MaskFrame` to restore the masking state back to `maskst` and
         -- set the masking state to `MaskedInterruptible`.
@@ -1201,6 +1226,21 @@ dropThrowToFrom :: IOSimThreadId -> Thread s a -> Thread s a
 dropThrowToFrom tid t =
     t { threadThrowTo = filter (\(_, Labelled tid' _, _) -> tid' /= tid)
                                (threadThrowTo t) }
+
+-- | The thread checks its pending async exceptions: at an interruptible point,
+-- where one of them would be raised, or when it terminates, which wakes up the
+-- threads blocked in `throwTo` to it.
+--
+-- The step races with the steps which cancelled any of its pending async
+-- exceptions (see `racingSteps`): the order decides if the exception is raised.
+-- It happens after them, unlike the steps of the thread before it.
+--
+checkPendingThrowTo :: Thread s a -> Thread s a
+checkPendingThrowTo t@Thread { threadId, threadVClock, threadPendingVClock, threadEffect } =
+    t { threadVClock        = threadVClock `leastUpperBoundVClock` threadPendingVClock
+      , threadPendingVClock = bottomVClock
+      , threadEffect        = threadEffect <> checksPendingEffect threadId
+      }
 
 
 -- Choose the next thread to run.
@@ -1439,6 +1479,7 @@ forkTimeoutInterruptThreads timeoutExpired simState =
                            threadStep    = 0,
                            threadVClock  = insertVClock tid' 0
                                          $ threadVClock t,
+                           threadPendingVClock = bottomVClock,
                            threadEffect  = mempty,
                            threadWaitsOn = Set.empty,
                            threadRacy    = threadRacy t
@@ -1616,6 +1657,7 @@ controlSimTraceST limit control mainAction =
         threadNextTId = 1,
         threadStep    = 0,
         threadVClock  = insertVClock (ThreadId []) 0 bottomVClock,
+        threadPendingVClock = bottomVClock,
         threadEffect  = mempty,
         threadWaitsOn = Set.empty,
         threadRacy    = False
@@ -1968,11 +2010,27 @@ racingSteps s s' =
   && (  stepEffect s `racingEffects` stepEffect s'
      || throwsTo s s'
      || throwsTo s' s
+     || cancelsChecked s s'
      )
   where throwsTo s1 s2 =
              stepThreadId s2 `elem` effectThrows (stepEffect s1)
-          -- `throwTo` races with any other effect
-          && stepEffect s2 /= mempty
+          -- `throwTo` races with any other effect.  Checking pending async
+          -- exceptions alone does not count: a `throwTo` just before or just
+          -- after the check raises the exception at the same point.
+          && not (onlyChecksPendingEffect (stepEffect s2))
+
+        -- s cancels a pending async exception of the thread of s', which
+        -- checks its pending async exceptions in s': if s' runs first, the
+        -- exception is raised (or the thrower is woken up, if the thread of
+        -- s' terminates), and s does not cancel it.
+        --
+        -- The other order does not race: if the check raises the exception
+        -- (or wakes up the thrower), a later `throwTo` to the thrower does not
+        -- cancel it; otherwise the later step cancels another exception, and
+        -- the two steps commute.
+        cancelsChecked s1 s2 =
+             stepThreadId s2 `Set.member` effectCancelsPending (stepEffect s1)
+          && stepThreadId s2 `Set.member` effectChecksPending  (stepEffect s2)
 
 currentStep :: Thread s a -> Step
 currentStep Thread { threadId     = stepThreadId,

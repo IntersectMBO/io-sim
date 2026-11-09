@@ -6,7 +6,10 @@ module Control.Monad.IOSimPOR.Types
   , forkEffect
   , throwToEffect
   , wakeupEffects
+  , cancelsPendingEffects
+  , checksPendingEffect
   , onlyReadEffect
+  , onlyChecksPendingEffect
   , racingEffects
   , ppEffect
     -- * Schedules
@@ -37,32 +40,46 @@ import Control.Monad.IOSim.CommonTypes
 -- execution step.  Only used by *IOSimPOR*.
 --
 data Effect = Effect {
-    effectReads  :: !(Set (Labelled TVarId)),
-    effectWrites :: !(Set (Labelled TVarId)),
-    effectForks  :: !(Set IOSimThreadId),
-    effectThrows :: ![IOSimThreadId],
-    effectWakeup :: !(Set IOSimThreadId)
+    effectReads          :: !(Set (Labelled TVarId)),
+    effectWrites         :: !(Set (Labelled TVarId)),
+    effectForks          :: !(Set IOSimThreadId),
+    effectThrows         :: ![IOSimThreadId],
+    effectWakeup         :: !(Set IOSimThreadId),
+    -- | Threads whose pending async exceptions changed, because a thread
+    -- blocked in `throwTo` to them was interrupted, which cancelled its
+    -- `throwTo`.
+    effectCancelsPending :: !(Set IOSimThreadId),
+    -- | Threads which checked their pending async exceptions: at an
+    -- interruptible point, where one of them would be raised, or when
+    -- terminating, which wakes up their throwers.  It can only be the thread
+    -- which executed the step.
+    effectChecksPending  :: !(Set IOSimThreadId)
   }
   deriving (Show, Eq)
 
 ppEffect :: Effect -> String
-ppEffect Effect { effectReads, effectWrites, effectForks, effectThrows, effectWakeup } =
+ppEffect Effect { effectReads, effectWrites, effectForks, effectThrows, effectWakeup,
+                  effectCancelsPending, effectChecksPending } =
   "Effect { " ++
     concat (List.intersperse ", " $
            [ "reads = "  ++ ppList (ppLabelled show) (Set.toList effectReads)  | not (null effectReads)  ]
         ++ [ "writes = " ++ ppList (ppLabelled show) (Set.toList effectWrites) | not (null effectWrites) ]
         ++ [ "forks = "  ++ ppList ppIOSimThreadId (Set.toList effectForks)    | not (null effectForks)  ]
         ++ [ "throws = " ++ ppList ppIOSimThreadId             effectThrows    | not (null effectThrows) ]
-        ++ [ "wakeup = " ++ ppList ppIOSimThreadId (Set.toList effectWakeup)   | not (null effectWakeup) ])
+        ++ [ "wakeup = " ++ ppList ppIOSimThreadId (Set.toList effectWakeup)   | not (null effectWakeup) ]
+        ++ [ "cancels pending = " ++ ppList ppIOSimThreadId (Set.toList effectCancelsPending)
+           | not (null effectCancelsPending) ]
+        ++ [ "checks pending = "  ++ ppList ppIOSimThreadId (Set.toList effectChecksPending)
+           | not (null effectChecksPending) ])
         ++ " }"
 
 
 instance Semigroup Effect where
-  Effect r w s ts wu <> Effect r' w' s' ts' wu' =
-    Effect (r <> r') (w <> w') (s <> s') (ts ++ ts') (wu <> wu')
+  Effect r w s ts wu cp chp <> Effect r' w' s' ts' wu' cp' chp' =
+    Effect (r <> r') (w <> w') (s <> s') (ts ++ ts') (wu <> wu') (cp <> cp') (chp <> chp')
 
 instance Monoid Effect where
-  mempty = Effect Set.empty Set.empty Set.empty [] Set.empty
+  mempty = Effect Set.empty Set.empty Set.empty [] Set.empty Set.empty Set.empty
 
 --
 -- Effect smart constructors
@@ -83,6 +100,12 @@ throwToEffect tid = mempty{ effectThrows = [tid] }
 wakeupEffects :: [IOSimThreadId] -> Effect
 wakeupEffects tids = mempty{effectWakeup = Set.fromList tids}
 
+cancelsPendingEffects :: [IOSimThreadId] -> Effect
+cancelsPendingEffects tids = mempty{effectCancelsPending = Set.fromList tids}
+
+checksPendingEffect :: IOSimThreadId -> Effect
+checksPendingEffect tid = mempty{effectChecksPending = Set.singleton tid}
+
 --
 -- Utils
 --
@@ -90,8 +113,19 @@ wakeupEffects tids = mempty{effectWakeup = Set.fromList tids}
 someTvarId :: SomeTVar s -> TVarId
 someTvarId (SomeTVar r) = tvarId r
 
+-- | Whether the effect only reads: `TVar`s, or the pending async exceptions of
+-- the thread.
+--
 onlyReadEffect :: Effect -> Bool
-onlyReadEffect e = e { effectReads = effectReads mempty } == mempty
+onlyReadEffect e = e { effectReads         = effectReads mempty
+                     , effectChecksPending = effectChecksPending mempty
+                     } == mempty
+
+-- | Whether the effect is empty, or it only checks the pending async
+-- exceptions of the thread.
+--
+onlyChecksPendingEffect :: Effect -> Bool
+onlyChecksPendingEffect e = e { effectChecksPending = effectChecksPending mempty } == mempty
 
 -- | Check if two effects race.  The two effects are assumed to come from
 -- different threads, from steps which do not wake one another, see

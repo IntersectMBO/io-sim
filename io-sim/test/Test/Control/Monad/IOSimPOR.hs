@@ -23,7 +23,7 @@ import Data.Set qualified as Set
 import System.Exit
 import System.IO.Error (ioeGetErrorString, isUserError)
 
-import Control.Exception (ArithException (..), AsyncException)
+import Control.Exception (ArithException (..), AsyncException, ErrorCall (..))
 import Control.Monad
 import Control.Monad.Fix
 
@@ -74,6 +74,15 @@ tests =
           (unit_throwTo_races_with_wakeup False)
       , testProperty "writer runs first"
           (unit_throwTo_races_with_wakeup True)
+      ]
+    , testGroup "cancelled throwTo races with a check of pending exceptions"
+      [ testGroup (show checkPoint)
+          [ testProperty "canceller runs first"
+              (unit_cancelled_throwTo_races_with_check checkPoint False)
+          , testProperty "target runs first"
+              (unit_cancelled_throwTo_races_with_check checkPoint True)
+          ]
+      | checkPoint <- [minBound .. maxBound]
       ]
     -- , testProperty "propPermutations" propPermutations
     ]
@@ -499,6 +508,84 @@ unit_throwTo_races_with_wakeup writerFirst =
       _ <- waitCatch t
       traverse_ wait ws
       readTVarIO committed
+
+
+-- | Where the target of a blocked `throwTo` checks its pending async
+-- exceptions.
+--
+data CheckPoint =
+    -- | it unmasks
+    CheckOnUnmask
+    -- | it writes a `TVar`, then it unmasks
+  | CheckOnUnmaskAfterWrite
+    -- | it blocks in `threadDelay`, while `MaskedInterruptible`
+  | CheckOnBlocking
+    -- | it terminates, which wakes up the thrower
+  | CheckOnTermination
+  deriving (Show, Eq, Enum, Bounded)
+
+-- | @A@ is blocked in `throwTo` to @T@, which is not interruptible until
+-- time 1.  At time 1, @B@ kills @A@, which cancels its `throwTo`, and @T@
+-- checks its pending async exceptions:
+--
+-- * if @B@ runs first, the exception from @A@ is never raised in @T@, and the
+--   `throwTo` of @A@ is interrupted;
+-- * if @T@ runs first, the exception from @A@ is raised in @T@ (or @T@
+--   terminates), and the `throwTo` of @A@ returns.  @A@ is masked, so the
+--   exception from @B@ is pending until @A@ unmasks.
+--
+-- IOSimPOR must explore both orders, whichever of them runs first.  In all but
+-- `CheckOnUnmask` and `CheckOnTermination`, @T@ takes a step before the
+-- check, which does not depend on @B@.
+--
+unit_cancelled_throwTo_races_with_check
+  :: CheckPoint
+  -> Bool -- ^ whether the target runs first
+  -> Property
+unit_cancelled_throwTo_races_with_check checkPoint targetFirst =
+    once $ exploreSimResults experiment $ \results ->
+      counterexample ("explored results: " ++ show (Set.toList results)) $
+      results === Set.fromList [False, True]
+  where
+    -- returns whether the `throwTo` of `A` was cancelled
+    experiment :: IOSim s Bool
+    experiment = do
+      exploreRaces
+      resA <- newTVarIO Nothing
+      aVar <- newEmptyTMVarIO
+      v    <- newTVarIO False
+      let canceller = do
+            threadDelay 1
+            atomically (readTMVar aVar) >>= killThread
+      -- at time 1, the thread forked last runs first, since it has the larger
+      -- thread id
+      when targetFirst $ void $ forkIO canceller
+      t <- case checkPoint of
+        CheckOnUnmask ->
+          uninterruptibleMask_ $ forkIOWithUnmask $ \unmask -> do
+            threadDelay 1
+            void $ try @_ @ErrorCall $ unmask (return ())
+        CheckOnUnmaskAfterWrite ->
+          uninterruptibleMask_ $ forkIOWithUnmask $ \unmask -> do
+            threadDelay 1
+            atomically (writeTVar v True)
+            void $ try @_ @ErrorCall $ unmask (return ())
+        CheckOnBlocking ->
+          mask_ $ forkIO $ do
+            uninterruptibleMask_ (threadDelay 1)
+            void $ try @_ @ErrorCall $ threadDelay 1
+        CheckOnTermination ->
+          uninterruptibleMask_ $ forkIO $
+            threadDelay 1
+      a <- mask_ $ forkIO $
+             try @_ @SomeException (throwTo t (ErrorCall "from A"))
+               >>= atomically . writeTVar resA . Just
+      atomically (putTMVar aVar a)
+      unless targetFirst $ void $ forkIO canceller
+      -- let all the threads run at time 1: the simulation ends when the main
+      -- thread returns
+      threadDelay 2
+      atomically $ readTVar resA >>= maybe retry (return . isLeft)
 
 
 -- | Explore the schedules of a simulation, and check the set of results of all
