@@ -187,7 +187,8 @@ data ThreadStatus = ThreadRunning
 
 data BlockedReason = BlockedOnSTM
                    | BlockedOnDelay
-                   | BlockedOnThrowTo
+                   | BlockedOnThrowTo !IOSimThreadId
+                     -- ^ blocked in `throwTo` to the given thread
   deriving (Eq, Show)
 
 -- | A labelled value.

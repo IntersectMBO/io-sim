@@ -894,10 +894,10 @@ schedule thread@Thread{
               let adjustTarget t =
                     t { threadThrowTo = (e, Labelled tid tlbl, vClock) : threadThrowTo t }
                   threads'       = Map.adjust adjustTarget tid' threads
-              trace <- deschedule (Blocked BlockedOnThrowTo) thread' simstate { threads = threads' }
+              trace <- deschedule (Blocked (BlockedOnThrowTo tid')) thread' simstate { threads = threads' }
               return $ SimPORTrace time tid tstep tlbl (EventThrowTo e tid')
                      $ SimPORTrace time tid tstep tlbl EventThrowToBlocked
-                     $ SimPORTrace time tid tstep tlbl (EventDeschedule (Blocked BlockedOnThrowTo))
+                     $ SimPORTrace time tid tstep tlbl (EventDeschedule (Blocked (BlockedOnThrowTo tid')))
                      $ trace
           else do
             -- The target thread has async exceptions unmasked, or is masked but
@@ -934,49 +934,48 @@ schedule thread@Thread{
                         , threadVClock  = vClock' `leastUpperBoundVClock` vClock
                         }
 
-                cancelThrowTo :: Bool
-                cancelThrowTo = case Map.lookup tid' threads of
-                  Just Thread { threadStatus = ThreadBlocked BlockedOnThrowTo }
-                    -> True
-                  _ -> False
-
-                -- the other threads whose pending async exceptions change:
-                -- this step races with their next check of pending async
-                -- exceptions, which decides if the exception is raised (or if
-                -- they wake up the thrower when they terminate)
-                cancelledTargets :: [IOSimThreadId]
-                cancelledTargets =
-                  [ threadId t
-                  | cancelThrowTo
-                  , t <- Map.elems threads
-                  , not (isThreadDone t)
-                  , any (\(_, Labelled tid'' _, _) -> tid'' == tid')
-                        (threadThrowTo t)
-                  ]
+                -- if the target thread is blocked in `throwTo`, the target of
+                -- its `throwTo`, whose pending async exceptions change: unless
+                -- it is this thread, this step races with its next check of
+                -- pending async exceptions, which decides if the exception is
+                -- raised (or if it wakes up the thrower when it terminates).
+                --
+                -- It cannot have terminated: terminating wakes up the threads
+                -- blocked in `throwTo` to it.
+                cancelledTarget :: Maybe IOSimThreadId
+                cancelledTarget = case Map.lookup tid' threads of
+                  Just Thread { threadStatus = ThreadBlocked (BlockedOnThrowTo tid'') }
+                    -> Just tid''
+                  _ -> Nothing
 
                 thread''
-                  | cancelThrowTo = (dropThrowToFrom tid' thread')
-                                      { threadEffect = threadEffect thread'
-                                                    <> cancelsPendingEffects cancelledTargets
-                                      }
-                  | otherwise     = thread'
+                  -- the target of the cancelled `throwTo` is this thread, which
+                  -- is not in `threads`
+                  | Just tid'' <- cancelledTarget
+                  , tid'' == tid
+                  = dropThrowToFrom tid' thread'
+                  | Just tid'' <- cancelledTarget
+                  = thread' { threadEffect = threadEffect thread'
+                                          <> cancelsPendingEffects [tid''] }
+                  | otherwise
+                  = thread'
 
-                -- the next check of pending async exceptions of the targets
-                -- happens after this step, but not their steps before it: they
+                -- the next check of pending async exceptions of the target
+                -- happens after this step, but not its steps before it: they
                 -- do not depend on this step, and might be reordered with it,
                 -- see `checkPendingThrowTo`
                 cancelThrowToAt :: Thread s a -> Thread s a
-                cancelThrowToAt t
-                  | threadId t `elem` cancelledTargets
-                  = (dropThrowToFrom tid' t)
-                      { threadPendingVClock = threadPendingVClock t
-                                              `leastUpperBoundVClock` vClock }
-                  | otherwise
-                  = t
+                cancelThrowToAt t =
+                  (dropThrowToFrom tid' t)
+                    { threadPendingVClock = threadPendingVClock t
+                                            `leastUpperBoundVClock` vClock }
 
                 simstate0
-                  | cancelThrowTo = simstate { threads = Map.map cancelThrowToAt threads }
-                  | otherwise     = simstate
+                  | Just tid'' <- cancelledTarget
+                  , tid'' /= tid
+                  = simstate { threads = Map.adjust cancelThrowToAt tid'' threads }
+                  | otherwise
+                  = simstate
                 simstate'@SimState { threads = threads' }
                            = snd (unblockThreads False vClock [tid'] simstate0)
                 threads''  = Map.adjust adjustTarget tid' threads'
@@ -1219,8 +1218,8 @@ schedulePendingThrowToAndDeschedule _ _ =
 -- | Drop the pending async exceptions thrown by the given thread.
 --
 -- Used when a thread blocked in `throwTo` is interrupted: its `throwTo` is
--- cancelled.  'BlockedOnThrowTo' does not record the target, but a thread is
--- blocked in at most one `throwTo`, so it is safe to apply it to all threads.
+-- cancelled.  It is applied to the target of the `throwTo`, which
+-- 'BlockedOnThrowTo' records.
 --
 dropThrowToFrom :: IOSimThreadId -> Thread s a -> Thread s a
 dropThrowToFrom tid t =
