@@ -160,6 +160,16 @@ tests =
     , testProperty "15" unit_async_15
     , testProperty "16" unit_async_16
     ]
+  , testGroup "pending async exceptions"
+    [ testProperty "raised when timeout returns, at blocking op (IO)"
+        unit_timeout_raises_pending_exception_at_blocking_op_IO
+    , testProperty "raised when timeout returns, at blocking op (IOSim)"
+        unit_timeout_raises_pending_exception_at_blocking_op_ST
+    , testProperty "forwarded timeout exception, rethrown (IO)"
+        unit_timeout_forwarded_exception_rethrown_IO
+    , testProperty "forwarded timeout exception, rethrown (IOSim)"
+        unit_timeout_forwarded_exception_rethrown_ST
+    ]
   , testGroup "STM reference semantics"
     [ testProperty "Reference vs IO"    prop_stm_referenceIO
     , testProperty "Reference vs Sim"   prop_stm_referenceSim
@@ -1599,3 +1609,38 @@ tryReadEmptyTBQueue sndRead = atomically $ do
 counterexamples :: Testable t => [String] -> t -> Property
 counterexamples []     p = property p
 counterexamples (c:cs) p = counterexample c (counterexamples cs p)
+
+-- | Similar to `ioProperty`.
+--
+ioSimProperty
+  :: Testable property
+  => Bool
+  -- ^ if True the property will fail if there are any threads which
+  -- didn't terminate when the main thread terminated.
+  -> (forall s. IOSim s property)
+  -> Property
+ioSimProperty strict iosim =
+  let trace = runSimTrace iosim in
+    counterexample (ppTrace_ trace)
+  . either (\e -> counterexample (show e) False)
+           property
+  . traceResult strict
+  $ trace
+
+
+unit_timeout_raises_pending_exception_at_blocking_op_IO :: Property
+unit_timeout_raises_pending_exception_at_blocking_op_IO =
+    once $ ioProperty prop_timeout_raises_pending_exception_at_blocking_op
+
+unit_timeout_raises_pending_exception_at_blocking_op_ST :: Property
+unit_timeout_raises_pending_exception_at_blocking_op_ST =
+    once $ ioSimProperty False
+         $ prop_timeout_raises_pending_exception_at_blocking_op
+
+unit_timeout_forwarded_exception_rethrown_IO :: Property
+unit_timeout_forwarded_exception_rethrown_IO =
+    once $ ioProperty prop_timeout_forwarded_exception_rethrown
+
+unit_timeout_forwarded_exception_rethrown_ST :: Property
+unit_timeout_forwarded_exception_rethrown_ST =
+    once $ ioSimProperty False prop_timeout_forwarded_exception_rethrown

@@ -2,11 +2,13 @@
 module Test.Control.Monad.Utils where
 
 import Data.Array
+import Data.Either (isLeft)
 import Data.Fixed (Fixed (..), Micro)
 import Data.Function (on)
 import Data.Graph
 import Data.List (sortBy)
 
+import Control.Exception (ErrorCall (..))
 import Control.Monad
 
 import Control.Concurrent.Class.MonadSTM.Strict
@@ -514,3 +516,97 @@ selectTraceSay (SimPORTrace _ _ _ _ (EventSay msg) trace) = msg : selectTraceSay
 selectTraceSay (SimPORTrace _ _ _ _ _              trace) = selectTraceSay trace
 selectTraceSay  _                                         = []
 
+
+--
+-- Pending async exceptions
+--
+
+-- | When `timeout` returns unmasked, a pending async exception is raised
+-- straight away: the code after `timeout` does not run.
+--
+-- @C@'s exception, and then the timeout's, are queued while the timed action
+-- is uninterruptibly masked.  The timed action decides where the timeout's
+-- exception is raised.
+--
+timeout_raises_pending_exception
+  :: forall m. ( MonadDelay m
+               , MonadFork  m
+               , MonadMask  m
+               , MonadTimer m
+               )
+  => (DiffTime -> m ())
+  -- ^ timed action
+  -> m Property
+timeout_raises_pending_exception action = do
+    me <- myThreadId
+    after <- newTVarIO False
+    _ <- forkIO $ threadDelay t0 >> throwTo me (ErrorCall "from C")
+    r <- try @_ @ErrorCall $ do
+           _ <- timeout t1 (action t1)
+           -- `C`'s exception must be raised before this runs
+           atomically (writeTVar after True)
+           threadDelay t1
+    ran <- readTVarIO after
+    return $ r === Left (ErrorCall "from C")
+        .&&. counterexample "the code after `timeout` ran" (not ran)
+  where
+    t0 = 0.05
+    t1 = 2 * t0
+
+-- | See 'timeout_raises_pending_exception': the timeout's exception is raised
+-- at a blocking operation within `mask_`, and unwinds through its
+-- 'MaskFrame', which restores 'Unmasked'.
+--
+prop_timeout_raises_pending_exception_at_blocking_op
+  :: forall m. ( MonadDelay m
+               , MonadFork  m
+               , MonadMask  m
+               , MonadTimer m
+               )
+  => m Property
+prop_timeout_raises_pending_exception_at_blocking_op =
+    timeout_raises_pending_exception
+      (\t1 -> mask_ $   uninterruptibleMask_ (threadDelay (t1 + 0.1))
+                     >> threadDelay t1)
+
+-- | The timed action catches the timeout's exception, and another thread
+-- forwards it back while the action is uninterruptibly masked.  Then the
+-- action rethrows it, so it unwinds to its own `TimeoutFrame` while the
+-- forwarded exception is pending.  Leaving the frame must not retract the
+-- forwarded exception: it is raised after `timeout` returns, and the
+-- forwarding thread's `throwTo` returns.  Otherwise the forwarding thread
+-- stays blocked in `throwTo` forever, and the simulation deadlocks.
+--
+-- The forwarding thread is forked within `uninterruptibleMask_`, so in the
+-- simulators its exception is pending when the action rethrows, whatever the
+-- schedule.  In `IO` it might be thrown later, and then it is raised at the
+-- interruptible point after `timeout`.
+--
+prop_timeout_forwarded_exception_rethrown
+  :: forall m. ( MonadDelay m
+               , MonadFork  m
+               , MonadMask  m
+               , MonadTimer m
+               )
+  => m Property
+prop_timeout_forwarded_exception_rethrown = do
+    me   <- myThreadId
+    done <- newEmptyTMVarIO
+    r <- try @_ @SomeException $ do
+      _ <- timeout 0.05 $ do
+        -- `threadDelay` is interruptible, the timeout fires here
+        r' <- try @_ @SomeException (threadDelay 1)
+        case r' of
+          Left e   -> uninterruptibleMask_ $ do
+            -- the forwarding thread blocks in `throwTo`
+            _ <- forkIO $ throwTo me e
+                       >> atomically (putTMVar done ())
+            threadDelay 0.05
+            -- unwinds to its own `TimeoutFrame`
+            throwIO e
+          Right () -> return ()
+      -- an interruptible point
+      atomically (takeTMVar done)
+    -- the forwarding thread's `throwTo` returned
+    atomically (takeTMVar done)
+    return $ counterexample (show r) (isLeft r)

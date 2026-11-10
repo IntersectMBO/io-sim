@@ -259,17 +259,41 @@ schedule !thread@Thread{
       -- Found a CatchFrame
       (Right thread'@Thread { threadControl = ThreadControl handlerAction handlerCtl
                             , threadMasking = maskst'
+                            , threadThrowTo
                             }, timers'', locks) -> do
         -- We found a suitable exception handler, continue with that,
-        -- but first cleanup any unwind `TimeoutFrame` locks
+        -- but first cleanup all unwound `TimeoutFrame`s.
         tids <- catMaybes <$> traverse closeTimeoutLock locks
-        let cleanups = traverse_ killThread tids
-        trace <- schedule thread' {
-                            threadControl =
-                              ThreadControl (case cleanups of
-                                               IOSim k' -> k' (\() -> handlerAction))
-                                            handlerCtl
-                          }
+        let -- NOTE: we could always run the cleanups within
+            -- `uninterruptibleMask_` (as GHC's `cleanupTimeout` does).  We
+            -- only wrap it when it matters for performance reasons.
+            --
+            -- When the wrapped cleanups end, the thread unmasks back to
+            -- `maskst'`, which raises a pending async exception if the thread
+            -- is `Unmasked`.
+            cleanups :: IOSim s ()
+            cleanups =
+              case maskst' of
+                -- the thread is not blocked, thus it is interruptible iff it is
+                -- `Unmasked`
+                Unmasked
+                  -- there are pending async exceptions: don't raise any of
+                  -- them until cleanup ends
+                  |  not (null threadThrowTo)
+                  -> uninterruptibleMask_ (traverse_ killThread tids)
+
+                  -- otherwise the thread is either masked or there are no
+                  -- pending async exceptions, so none of the cleanups will be
+                  -- interrupted, since they neither block nor yield (the
+                  -- assassin threads are never masked, so `killThread` from
+                  -- any of the cleanups is non-blocking).  This holds even if
+                  -- an assassin won the race, unlike in `IOSimPOR`, where
+                  -- `killThread` yields.
+                _ -> traverse_ killThread tids
+        trace <- schedule thread' { threadControl =
+                                      ThreadControl (unIOSim cleanups (\() -> handlerAction))
+                                                    handlerCtl
+                                  }
                           simstate { timers = timers'' }
         return (SimTrace time tid tlbl (EventThrow e) $
                 SimTrace time tid tlbl (EventMask maskst') trace)
