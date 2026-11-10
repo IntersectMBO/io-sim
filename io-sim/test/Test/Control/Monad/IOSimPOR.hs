@@ -139,6 +139,12 @@ tests =
       , testProperty "8"  unit_async_8
       , testProperty "9"  unit_async_9
       ]
+    , testGroup "pending async exceptions"
+      [ testProperty "raised when timeout returns, at blocking op"
+          unit_timeout_raises_pending_exception_at_blocking_op_ST
+      , testProperty "forwarded timeout exception, rethrown"
+          unit_timeout_forwarded_exception_rethrown_ST
+      ]
     , testGroup "STM reference semantics"
       [ testProperty "Reference vs Sim"   prop_stm_referenceSim
       ]
@@ -1260,3 +1266,13 @@ unit_catch_throwTo_masking_state_async_mayblock_ST ms =
     case traceResult False trace of
       Right a -> a
       Left e  -> counterexample (show e) False
+
+unit_timeout_raises_pending_exception_at_blocking_op_ST :: Property
+unit_timeout_raises_pending_exception_at_blocking_op_ST =
+    once $ ioSimPORProperty False
+         $ prop_timeout_raises_pending_exception_at_blocking_op
+
+unit_timeout_forwarded_exception_rethrown_ST :: Property
+unit_timeout_forwarded_exception_rethrown_ST =
+    once $ ioSimPORProperty False
+         $ prop_timeout_forwarded_exception_rethrown

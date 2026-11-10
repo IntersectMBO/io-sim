@@ -53,7 +53,7 @@ import Data.List qualified as List
 import Data.List.Trace qualified as Trace
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (catMaybes, mapMaybe)
+import Data.Maybe (catMaybes, isJust, mapMaybe)
 import Data.Ord
 import Data.Set (Set)
 import Data.Set qualified as Set
@@ -373,20 +373,71 @@ schedule thread@Thread{
         -- Found a CatchFrame
         (Right thread0@Thread { threadControl = ThreadControl handlerAction handlerCtl
                               , threadMasking = maskst'
+                              , threadThrowTo
                               }, timers'', locks) -> do
           -- We found a suitable exception handler, continue with that,
-          -- but first cleanup any unwind `TimeoutFrame` locks.
+          -- but first cleanup all unwound `TimeoutFrame`s.
           -- We record a step, in case there is no exception handler on replay.
           tids <- traverse closeTimeoutLock locks
           let -- at least one assassin thread won the race
+              assassin = isJust `any` tids
+
               cleanups :: IOSim s ()
               cleanups = traverse_ killThread (catMaybes tids)
 
-              thread1 = thread0 { threadControl =
-                                    ThreadControl (case cleanups of
-                                                     IOSim k' -> k' (\() -> handlerAction))
-                                                  handlerCtl
-                                }
+              -- NOTE: we could always run the cleanups within
+              -- `uninterruptibleMask_` (as GHC's `cleanupTimeout` does), but
+              -- every `MaskFrame` pop is a step, so it would change the step
+              -- numbering of every caught exception.  We only wrap it when it
+              -- matters.
+              --
+              -- When the wrapped cleanups end, the thread unmasks back to
+              -- `maskst'`, which raises a pending async exception if the thread
+              -- is `Unmasked`.
+              needMask =
+                case maskst' of
+                  -- the thread is not blocked, thus it is interruptible iff it
+                  -- is `Unmasked`
+                  Unmasked
+                    -- at least one assassin won the race: kill all of them
+                    -- (including the ones that are blocked on `throwTo`, or not
+                    -- thrown yet) before any assassin's async exception is
+                    -- delivered.  Unlike in `IOSim`, `killThread` yields, so
+                    -- without the mask an assassin which holds its lock, but
+                    -- is not killed yet, could throw in the middle of the
+                    -- cleanups.
+                    |  assassin
+                    -> True
+
+                    -- there are pending async exceptions: don't raise any of
+                    -- them until cleanup ends
+                    |  not (null threadThrowTo)
+                    -> True
+
+                  -- otherwise none of the cleanups will be interrupted: either
+                  -- the thread is masked, and the cleanups do not block (the
+                  -- assassin threads are never masked, so `killThread` from
+                  -- any of the cleanups is non-blocking), or no assassin won
+                  -- the race, so the cleanups only unregister the timeouts,
+                  -- and neither block nor yield.
+                  _ -> False
+              thread1 =
+                if needMask
+                  -- unlike in `IOSim` case we apply masking directly.  Using
+                  -- `uninterruptibleMask_` would add a scheduling point before
+                  -- the `uninterruptibleMask_` is entered when a pending async
+                  -- can be delivered.
+                  then
+                    thread0 { threadMasking = MaskedUninterruptible
+                            , threadControl = ThreadControl
+                                                (runIOSim cleanups)
+                                                (MaskFrame (\() -> handlerAction) maskst' handlerCtl)
+                            }
+                  else
+                    thread0 { threadControl = ThreadControl
+                                                (unIOSim cleanups (\() -> handlerAction))
+                                                handlerCtl
+                            }
               (thread', eff)  = stepThread thread1
               control'        = advanceControl (threadStepId thread0) control
               races'          = updateRaces thread0 simstate
@@ -395,8 +446,10 @@ schedule thread@Thread{
                                               timers = timers'' }
           return (SimPORTrace time tid tstep tlbl (EventThrow e) $
                   SimPORTrace time tid tstep tlbl (EventMask maskst') $
+                  traceMany [ (time, tid, tstep, tlbl, EventMask MaskedUninterruptible)
+                            | needMask ] $
                   SimPORTrace time tid tstep tlbl (EventEffect vClock eff) $
-                  SimPORTrace time tid tstep tlbl (EventRaces races')
+                  SimPORTrace time tid tstep tlbl (EventRaces races') $
                   trace)
 
         (Left isMain, timers'', locks)
