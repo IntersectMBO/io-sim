@@ -647,10 +647,16 @@ schedule thread@Thread{
                               , threadRacy    = threadRacy thread
                               }
             threads' = Map.insert tid' thread'' threads
+            -- A thread racing by its label lends that to the threads it forks,
+            -- until they are labelled themselves.
+            racyByLabel'
+              | tid `Set.member` racyByLabel simstate = Set.insert tid' (racyByLabel simstate)
+              | otherwise                             = racyByLabel simstate
         -- A newly forked thread may have a higher priority, so we deschedule this one.
         !trace <- deschedule Yield thread'
-                    simstate { runqueue = insertThread thread'' runqueue
-                             , threads  = threads' }
+                    simstate { runqueue    = insertThread thread'' runqueue
+                             , threads     = threads'
+                             , racyByLabel = racyByLabel' }
         return $ SimPORTrace time tid tstep tlbl (EventThreadForked tid')
                $ SimPORTrace time tid tstep tlbl (EventDeschedule Yield)
                $ trace
