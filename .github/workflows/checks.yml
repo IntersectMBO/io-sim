@@ -18,7 +18,7 @@ jobs:
       run: |
         sudo apt install -y fd-find
 
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: git fetch
       run: git fetch origin main:main
@@ -68,7 +68,7 @@ jobs:
         which stylish-haskell
         stylish-haskell --version
 
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: "Run `stylish-haskell`"
       run: |
