@@ -208,7 +208,12 @@ data SimState s a = SimState {
        control0         :: !ScheduleControl,
        -- | limit on the computation time allowed per scheduling step, for
        -- catching infinite loops etc
-       perStepTimeLimit :: Maybe Int
+       perStepTimeLimit :: Maybe Int,
+       -- | the predicate 'exploreRacesOfThreadsLabelled' gave, if any
+       racyLabel        :: Maybe (ThreadLabel -> Bool),
+       -- | the threads whose label satisfies 'racyLabel': they race, whatever
+       -- their 'IOSimThreadId'
+       racyByLabel      :: !(Set IOSimThreadId)
 
      }
 
@@ -226,10 +231,22 @@ initialState =
       races    = noRaces,
       control  = ControlDefault,
       control0 = ControlDefault,
-      perStepTimeLimit = Nothing
+      perStepTimeLimit = Nothing,
+      racyLabel   = Nothing,
+      racyByLabel = Set.empty
     }
   where
     epoch1970 = UTCTime (fromGregorian 1970 1 1) 0
+
+-- | Record whether the thread, given this label, races by its label: a label
+-- that no longer satisfies the predicate stops it racing.
+labelledRacy :: IOSimThreadId -> ThreadLabel -> SimState s a -> SimState s a
+labelledRacy tid l simstate@SimState{ racyLabel, racyByLabel } =
+    case racyLabel of
+      Nothing -> simstate
+      Just p
+        | p l       -> simstate { racyByLabel = Set.insert tid racyByLabel }
+        | otherwise -> simstate { racyByLabel = Set.delete tid racyByLabel }
 
 invariant :: Maybe (Thread s a) -> SimState s a -> x -> x
 
@@ -714,7 +731,7 @@ schedule thread@Thread{
       LabelThread tid' l k | tid' == tid -> do
         let thread' = thread { threadControl = ThreadControl k ctl
                              , threadLabel   = Just l }
-        schedule thread' simstate
+        schedule thread' (labelledRacy tid l simstate)
 
       GetThreadLabel tid' k -> do
         let tlbl' | tid' == tid = tlbl
@@ -726,12 +743,16 @@ schedule thread@Thread{
       LabelThread tid' l k -> do
         let thread'  = thread { threadControl = ThreadControl k ctl }
             threads' = Map.adjust (\t -> t { threadLabel = Just l }) tid' threads
-        schedule thread' simstate { threads = threads' }
+        schedule thread' (labelledRacy tid' l simstate { threads = threads' })
 
       ExploreRaces k -> do
         let thread'  = thread { threadControl = ThreadControl k ctl
                               , threadRacy    = True }
         schedule thread' simstate
+
+      ExploreRacesOfThreadsLabelled p k -> do
+        let thread'  = thread { threadControl = ThreadControl k ctl }
+        schedule thread' simstate { racyLabel = Just p }
 
       Fix f k -> do
         r <- newSTRef (throw NonTermination)
@@ -1770,7 +1791,7 @@ stepThread thread@Thread { threadId     = tid,
 -- with it.
 updateRaces :: Thread s a -> SimState s a -> Races
 updateRaces thread@Thread { threadId = tid }
-            SimState{ control, threads, races = races@Races { activeRaces } } =
+            SimState{ control, threads, racyByLabel, races = races@Races { activeRaces } } =
     let
         newStep@Step{ stepEffect = newEffect } = currentStep thread
 
@@ -1782,7 +1803,8 @@ updateRaces thread@Thread { threadId = tid }
 
         -- A new step to add to the `activeRaces` list.
         newStepInfo :: Maybe StepInfo
-        !newStepInfo | isNotRacyThreadId tid = Nothing
+        !newStepInfo | isNotRacyThreadId tid
+                     , tid `Set.notMember` racyByLabel = Nothing
                        -- non-racy threads do not race
 
                      | Set.null concurrent   = Nothing

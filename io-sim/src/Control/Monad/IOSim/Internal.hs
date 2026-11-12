@@ -633,6 +633,9 @@ schedule !thread@Thread{
     ExploreRaces k ->
       schedule thread{ threadControl = ThreadControl k ctl } simstate
 
+    ExploreRacesOfThreadsLabelled _ k ->
+      schedule thread{ threadControl = ThreadControl k ctl } simstate
+
     Fix f k -> do
       r <- newSTRef (throw NonTermination)
       x <- unsafeInterleaveST $ readSTRef r
