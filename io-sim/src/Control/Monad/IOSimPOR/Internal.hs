@@ -752,7 +752,12 @@ schedule thread@Thread{
 
       ExploreRacesOfThreadsLabelled p k -> do
         let thread'  = thread { threadControl = ThreadControl k ctl }
-        schedule thread' simstate { racyLabel = Just p }
+            labelled = Set.fromList
+                         [ threadId t
+                         | t <- thread : Map.elems threads
+                         , Just l <- [threadLabel t]
+                         , p l ]
+        schedule thread' simstate { racyLabel = Just p, racyByLabel = labelled }
 
       Fix f k -> do
         r <- newSTRef (throw NonTermination)

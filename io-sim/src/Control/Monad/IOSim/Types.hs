@@ -150,10 +150,12 @@ traceM :: Typeable a => a -> IOSim s ()
 traceM !x = IOSim $ oneShot $ \k -> Output (toDyn x) (k ())
 
 -- | /IOSimPOR/: from now on, take into account, when discovering races, each
--- thread once it is given a label that satisfies the predicate, until it is
--- given one that does not. Unlike 'exploreRaces', this does not make the
--- threads such a thread forks racy: each thread races by its own label. A later
--- call replaces the predicate. 'runSimTrace' ignores it.
+-- thread whose label satisfies the predicate: a thread already so labelled,
+-- and a thread once it is given such a label, until it is given one that does
+-- not. Unlike 'exploreRaces', this does not make the threads such a thread
+-- forks racy: each thread races by its own label. A later call replaces the
+-- predicate. Calling it once a test has set up what it wants to explore keeps
+-- the races of the set-up out of the exploration. 'runSimTrace' ignores it.
 exploreRacesOfThreadsLabelled :: (ThreadLabel -> Bool) -> IOSim s ()
 exploreRacesOfThreadsLabelled p = IOSim $ oneShot $ \k -> ExploreRacesOfThreadsLabelled p (k ())
 
