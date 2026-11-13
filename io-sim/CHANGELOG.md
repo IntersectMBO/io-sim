@@ -1,5 +1,14 @@
 # Revision history of io-sim
 
+## Next version
+
+### Non-breaking changes
+
+* New primitive `IOSimPOR.exploreRacesOfThreadsLabelled` which accepts a list of
+  labels and races only threads whose labels match the list (even already
+  labelled). Unlabelled child threads also are considered racy.
+
+
 ## 1.11.0.0
 
 ### Breaking changes
