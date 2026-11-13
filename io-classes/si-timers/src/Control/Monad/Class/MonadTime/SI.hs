@@ -1,14 +1,15 @@
-{-# LANGUAGE DefaultSignatures  #-}
-{-# LANGUAGE DeriveAnyClass     #-}
-{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DefaultSignatures      #-}
+{-# LANGUAGE DeriveAnyClass         #-}
+{-# LANGUAGE DerivingStrategies     #-}
+{-# LANGUAGE TypeFamilies           #-}
+{-# LANGUAGE TypeFamilyDependencies #-}
 
 module Control.Monad.Class.MonadTime.SI
   ( MonadTime (..)
   , MonadMonotonicTime (..)
+  , TimeDuration (..)
     -- * 'DiffTime' and its action on 'Time'
   , Time (..)
-  , diffTime
-  , addTime
   , DiffTime
     -- * 'NominalTime' and its action on 'UTCTime'
   , UTCTime
@@ -47,15 +48,31 @@ newtype Time = Time DiffTime
 instance Show Time where
   show (Time t) = "Time " ++ showFixed True (realToFrac t :: Pico)
 
--- | The time duration between two points in time (positive or negative).
-diffTime :: Time -> Time -> DiffTime
-diffTime (Time t) (Time t') = t - t'
+-- | Time type @t@ paired with its associated duration type
+-- @'Duration' t@ forming a monoid action.
+--
+class TimeDuration t where
+  -- | The time duration between two points in time (positive or negative).
+  type Duration t = d | d -> t
 
--- | Add a duration to a point in time, giving another time.
-addTime :: DiffTime -> Time -> Time
-addTime d (Time t) = Time (d + t)
+  -- | @'diffT' t2 t1@ is the duration from @t1@ to @t2@.
+  diffTime :: t -> t -> Duration t
+
+  -- | Add a duration to a point in time, giving another time.
+  addTime  :: Duration t -> t -> t
 
 infixr 9 `addTime`
+
+instance TimeDuration UTCTime where
+  type Duration UTCTime = NominalDiffTime
+  diffTime = diffUTCTime
+  addTime = addUTCTime
+
+instance TimeDuration Time where
+  type Duration Time = DiffTime
+  diffTime (Time t) (Time t') = t - t'
+  addTime d (Time t) = Time (d + t)
+
 
 class MonadMonotonicTimeNSec m => MonadMonotonicTime m where
   getMonotonicTime :: m Time
