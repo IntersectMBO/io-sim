@@ -36,6 +36,8 @@ module Control.Monad.IOSim.Types
   , withBranching
   , withStepTimelimit
   , withReplay
+  , withRacyByLabel
+  , withRacyMainThread
   , stdExplorationOptions
   , EventlogEvent (..)
   , EventlogMarker (..)
@@ -182,7 +184,7 @@ data SimA s a where
                   SimA s a -> (e -> SimA s a) -> (a -> SimA s b) -> SimA s b
   Evaluate     :: a -> (a -> SimA s b) -> SimA s b
 
-  Fork           :: IOSim s () -> (IOSimThreadId -> SimA s b) -> SimA s b
+  Fork           :: Maybe ThreadLabel -> IOSim s () -> (IOSimThreadId -> SimA s b) -> SimA s b
   GetThreadId    :: (IOSimThreadId -> SimA s b) -> SimA s b
   LabelThread    :: IOSimThreadId -> String -> SimA s b -> SimA s b
   GetThreadLabel :: IOSimThreadId -> (Maybe String -> SimA s b) -> SimA s b
@@ -470,15 +472,35 @@ instance MonadThread (IOSim s) where
   labelThread t l  = IOSim $ oneShot $ \k -> LabelThread t l (k ())
   threadLabel t    = IOSim $ oneShot $ \k -> GetThreadLabel t k
 
+-- | Fork a thread, with an optional label.  The label is passed to the
+-- scheduler, so it is available when the thread is forked (see
+-- `explorationRacyByLabel`).
+--
+forkWith :: Maybe ThreadLabel -> IOSim s () -> IOSim s IOSimThreadId
+forkWith lbl task = IOSim $ oneShot $ \k -> Fork lbl task k
+
+-- | `forkFinally` with an optional label.
+--
+forkFinallyWith :: Maybe ThreadLabel
+                -> IOSim s a
+                -> (Either SomeException a -> IOSim s ())
+                -> IOSim s IOSimThreadId
+forkFinallyWith lbl task k = mask $ \restore ->
+                               forkWith lbl $ try (restore task) >>= k
+
 instance MonadFork (IOSim s) where
-  forkIO task        = IOSim $ oneShot $ \k -> Fork task k
-  forkOn _ task      = IOSim $ oneShot $ \k -> Fork task k
-  forkIOWithUnmask f = forkIO (f unblock)
-  forkFinally task k = mask $ \restore ->
-                       forkIO $ try (restore task) >>= k
+  forkIO             = forkWith Nothing
+  forkOn _           = forkWith Nothing
+  forkIOWithUnmask f = forkWith Nothing (f unblock)
+  forkFinally        = forkFinallyWith Nothing
   throwTo tid e      = IOSim $ oneShot $ \k -> ThrowTo (toException e) tid (k ())
   yield              = IOSim $ oneShot $ \k -> YieldSim (k ())
   getNumCapabilities = return 1
+
+  forkLabelledIO                 = forkWith . Just
+  forkLabelledOn lbl _           = forkWith (Just lbl)
+  forkLabelledIOWithUnmask lbl f = forkLabelledIO lbl (f unblock)
+  forkLabelledFinally            = forkFinallyWith . Just
 
 instance MonadTest (IOSim s) where
   exploreRaces       = IOSim $ oneShot $ \k -> ExploreRaces (k ())
@@ -648,16 +670,21 @@ instance Ord (Async s a) where
 instance Functor (Async s) where
   fmap f (Async tid a) = Async tid (fmap f <$> a)
 
+-- | `async` with an optional thread label.
+--
+asyncWith :: Maybe ThreadLabel -> IOSim s a -> IOSim s (Async s a)
+asyncWith lbl action = do
+    var <- MonadSTM.newEmptyTMVarIO
+    tid <- mask $ \restore ->
+             forkWith lbl $ try (restore action)
+                        >>= MonadSTM.atomically . MonadSTM.putTMVar var
+    MonadSTM.labelTMVarIO var ("async-" ++ show tid)
+    return (Async tid (MonadSTM.readTMVar var))
+
 instance MonadAsync (IOSim s) where
   type Async (IOSim s) = Async s
 
-  async action = do
-    var <- MonadSTM.newEmptyTMVarIO
-    tid <- mask $ \restore ->
-             forkIO $ try (restore action)
-                  >>= MonadSTM.atomically . MonadSTM.putTMVar var
-    MonadSTM.labelTMVarIO var ("async-" ++ show tid)
-    return (Async tid (MonadSTM.readTMVar var))
+  async = asyncWith Nothing
 
   asyncOn _  = async
   asyncBound = async
@@ -672,6 +699,13 @@ instance MonadAsync (IOSim s) where
 
   asyncWithUnmask k = async (k unblock)
   asyncOnWithUnmask _ k = async (k unblock)
+
+  asyncLabelled = asyncWith . Just
+
+  asyncLabelledOn lbl _ = asyncLabelled lbl
+  asyncLabelledBound lbl = asyncLabelled lbl
+  asyncLabelledWithUnmask lbl k = asyncLabelled lbl (k unblock)
+  asyncLabelledOnWithUnmask lbl _ k = asyncLabelled lbl (k unblock)
 
 -- | This provides access to (almost) everything from the
 -- @primitive@ package, but don't try to use the @MVar@s as that will not
@@ -1364,7 +1398,7 @@ data ExplorationOptions = ExplorationOptions{
     -- ^ A schedule to replay.
     --
     -- The default value is `Nothing`.
-    explorationDebugLevel    :: Int
+    explorationDebugLevel    :: Int,
     -- ^ Log detailed trace to stderr containing information on discovered
     -- races.  The trace does not contain the result of the simulation, unless
     -- one will do that explicitly inside the simulation.
@@ -1375,8 +1409,47 @@ data ExplorationOptions = ExplorationOptions{
     --
     -- NOTE: discovered schedules & races are not exposed to the user in the
     -- callback of `exploreSimTrace` or in the output of `controlSimTrace`.
+    explorationRacyByLabel   :: Maybe ThreadLabel -> Bool
+    -- ^ Whenever we fork a new thread we call `explorationRacyByLabel` with the
+    -- label of the forked thread.  For this you must use one of the
+    -- `forkLabelled` or `asyncLabelled` family of functions. The main thread is
+    -- labelled @"main"@.  If `True` is returned all steps of the forked thread
+    -- will take part in race discovery.  If a thread is racy, then all its
+    -- child threads are racy, regardless of the `explorationRacyByLabel` value
+    -- (i.e. racy flag is sticky).
+    --
+    -- NOTE: you need the _two_ (or more) possibly racing threads to be marked
+    -- as racy to discover any races between them.
+  }
+
+data ShowExplorationOptions_ = ExplorationOptions_ {
+    explorationScheduleBound_ :: Int,
+    explorationBranching_     :: Int,
+    explorationStepTimelimit_ :: Maybe Int,
+    explorationReplay_        :: Maybe ScheduleControl,
+    explorationDebugLevel_    :: Int
   }
   deriving Show
+
+instance Show ExplorationOptions where
+    showsPrec d
+      ExplorationOptions {
+        explorationScheduleBound,
+        explorationBranching,
+        explorationStepTimelimit,
+        explorationReplay,
+        explorationDebugLevel,
+        explorationRacyByLabel = _
+      }
+      =
+      showsPrec d
+        ExplorationOptions_ {
+          explorationScheduleBound_ = explorationScheduleBound,
+          explorationBranching_     = explorationBranching,
+          explorationStepTimelimit_ = explorationStepTimelimit,
+          explorationReplay_        = explorationReplay,
+          explorationDebugLevel_    = explorationDebugLevel
+        }
 
 stdExplorationOptions :: ExplorationOptions
 stdExplorationOptions = ExplorationOptions{
@@ -1384,8 +1457,9 @@ stdExplorationOptions = ExplorationOptions{
     explorationBranching     = 3,
     explorationStepTimelimit = Nothing,
     explorationReplay        = Nothing,
-    explorationDebugLevel    = 0
-    }
+    explorationDebugLevel    = 0,
+    explorationRacyByLabel   = const False
+  }
 
 type ExplorationSpec = ExplorationOptions -> ExplorationOptions
 
@@ -1400,3 +1474,20 @@ withStepTimelimit n e = e{explorationStepTimelimit = Just n}
 
 withReplay :: ScheduleControl -> ExplorationSpec
 withReplay r e = e{explorationReplay = Just r}
+
+-- | The thread and its sub-threads of return `True` all part of the race
+-- discovery.
+--
+-- NOTE: this function is called when a thread is forked,
+-- you must use one of the `forkLabelledIO`, `asyncLabelled`,
+-- `withAsyncLabelled` and friends for the label to be available when the
+-- thread is forked.  When using `labelThisThread`, the function was already
+-- was invoked, so that label won't be seen.
+withRacyByLabel :: (Maybe ThreadLabel -> Bool)
+                -> ExplorationSpec
+withRacyByLabel racyByLabel e = e{explorationRacyByLabel = racyByLabel}
+
+-- | All threads, including the main thread are part of race discovery.
+--
+withRacyMainThread :: ExplorationSpec
+withRacyMainThread e = e{explorationRacyByLabel = const True}

@@ -1,5 +1,34 @@
 # Revsion history of io-classes
 
+## next
+
+### Breaking changes
+
+* `MonadFork` new api:
+  - `forkLabelledIO`
+  - `forkLabelledOn`
+  - `forkLabelledIOWithUnmask`
+  - `forkLabelledFinally`
+* `MonadAsync` new api:
+  - `asyncLabelled`
+  - `asyncLabelledBound`
+  - `asyncLabelledOn`
+  - `withAsyncLabelled`
+  - `withAsyncLabelledBound`
+  - `withAsyncLabelledOn`
+  - `asyncLabelledWithUnmask`
+  - `asyncLabelledOnWithUnmask`
+  - `withAsyncLabelledWithUnmask`
+  - `withAsyncLabelledOnWithUnmask`
+
+These function allow to a precise control over which threads are part of
+`IOSimPOR` schedule exploration.
+
+* `withAsyncWithUnmask` and `withAsyncOnWithUnmask` for `IOSim` are now
+  matching the masking state of the `IO` instances.
+
+### Non-breaking change
+
 ## 1.11.0.0
 
 ### Breaking changes

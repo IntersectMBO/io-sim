@@ -39,6 +39,7 @@ module Control.Monad.IOSimPOR.Internal
   , controlSimTraceST
   , ScheduleControl (..)
   , ScheduleMod (..)
+  , isRacyThreadId
   ) where
 
 import Prelude hiding (read)
@@ -211,7 +212,8 @@ data SimState s a = SimState {
        control0         :: !ScheduleControl,
        -- | limit on the computation time allowed per scheduling step, for
        -- catching infinite loops etc
-       perStepTimeLimit :: Maybe Int
+       perStepTimeLimit :: Maybe Int,
+       racyByLabel      :: Maybe ThreadLabel -> Bool
 
      }
 
@@ -229,7 +231,8 @@ initialState =
       races    = noRaces,
       control  = ControlDefault,
       control0 = ControlDefault,
-      perStepTimeLimit = Nothing
+      perStepTimeLimit = Nothing,
+      racyByLabel = const False
     }
   where
     epoch1970 = UTCTime (fromGregorian 1970 1 1) 0
@@ -282,7 +285,8 @@ schedule thread@Thread{
            nextVid, nextTmid, nextUniq,
            curTime  = time,
            control,
-           perStepTimeLimit
+           perStepTimeLimit,
+           racyByLabel
          }
 
   | controlTargets (tid,tstep) control =
@@ -683,10 +687,11 @@ schedule thread@Thread{
         let thread' = thread { threadControl = ThreadControl k ctl }
         schedule thread' simstate
 
-      Fork a k -> do
-        let nextTId = threadNextTId thread
-            tid'    = childThreadId (threadRacy thread) tid nextTId
-            thread' = thread { threadControl = ThreadControl (k tid') ctl,
+      Fork threadLabel a k -> do
+        let nextTId  = threadNextTId thread
+            tid'     = childThreadId (threadRacy thread || racyByLabel threadLabel)
+                                     tid nextTId
+            thread'  = thread { threadControl = ThreadControl (k tid') ctl,
                                 threadNextTId = nextTId + 1,
                                 threadEffect  = effect
                                              <> forkEffect tid'
@@ -698,14 +703,14 @@ schedule thread@Thread{
                               , threadMasking = threadMasking thread
                               , threadThrowTo = []
                               , threadClockId = threadClockId thread
-                              , threadLabel   = Nothing
+                              , threadLabel
                               , threadNextTId = 1
                               , threadStep    = 0
                               , threadVClock  = insertVClock tid' 0
                                               $ vClock
                               , threadEffect  = mempty
                               , threadWaitsOn = Set.empty
-                              , threadRacy    = threadRacy thread
+                              , threadRacy    = isRacyThreadId tid'
                               }
             threads' = Map.insert tid' thread'' threads
         -- A newly forked thread may have a higher priority, so we deschedule this one.
@@ -1593,35 +1598,50 @@ lookupThreadLabel tid threads = join (threadLabel <$> Map.lookup tid threads)
 -- more convenient way is exposed by 'runSimTrace'.
 --
 runSimTraceST :: forall s a. IOSim s a -> ST s (SimTrace a)
-runSimTraceST mainAction = controlSimTraceST Nothing ControlDefault mainAction
+runSimTraceST mainAction =
+    controlSimTraceST
+      Nothing
+      ControlDefault
+      (const False)
+      mainAction
 
-controlSimTraceST :: Maybe Int -> ScheduleControl -> IOSim s a -> ST s (SimTrace a)
-controlSimTraceST limit control mainAction =
+controlSimTraceST :: Maybe Int
+                  -> ScheduleControl
+                  -> (Maybe ThreadLabel -> Bool)
+                  -> IOSim s a
+                  -> ST s (SimTrace a)
+controlSimTraceST limit control racyByLabel mainAction =
   SimPORTrace (curTime initialState)
-              (threadId mainThread)
+              threadId
               0
-              (threadLabel mainThread)
+              threadLabel
               (EventSimStart control)
   <$> schedule mainThread initialState { control  = control,
                                          control0 = control,
-                                         perStepTimeLimit = limit
+                                         perStepTimeLimit = limit,
+                                         racyByLabel
                                        }
   where
-    mainThread =
+    threadLabel = Just "main"
+    threadRacy  = racyByLabel threadLabel
+    threadId    = if threadRacy
+                    then RacyThreadId []
+                    else ThreadId []
+    mainThread  =
       Thread {
-        threadId      = ThreadId [],
+        threadId,
         threadControl = ThreadControl (runIOSim mainAction) MainFrame,
         threadStatus  = ThreadRunning,
         threadMasking = Unmasked,
         threadThrowTo = [],
         threadClockId = ClockId [],
-        threadLabel   = Just "main",
+        threadLabel,
         threadNextTId = 1,
         threadStep    = 0,
-        threadVClock  = insertVClock (ThreadId []) 0 bottomVClock,
+        threadVClock  = insertVClock threadId 0 bottomVClock,
         threadEffect  = mempty,
         threadWaitsOn = Set.empty,
-        threadRacy    = False
+        threadRacy
       }
 
 

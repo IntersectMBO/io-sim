@@ -34,6 +34,8 @@ module Control.Monad.IOSim
   , withBranching
   , withStepTimelimit
   , withReplay
+  , withRacyByLabel
+  , withRacyMainThread
     -- * Lift ST computations
   , liftST
     -- * Simulation time
@@ -527,8 +529,9 @@ runSimTrace mainAction = runST (runSimTraceST mainAction)
 -- much more state to track and hence it is slower).
 --
 -- On property failure it will show the failing schedule (`ScheduleControl`)
--- which can be passed to `controlSimTrace` to reproduce the failure without
--- discovering the schedule.
+-- which can be passed to `controlSimTrace` and the same
+-- `explorationRacyByLabel` value to reproduce the failure without discovering
+-- the schedule.
 --
 exploreSimTrace
   :: forall a test. Testable test
@@ -560,7 +563,10 @@ exploreSimTrace optsf mainAction k =
       -- finished with trace.
       let (readRaces, trace0) = detachTraceRaces (explorationDebugLevel opts)
                               $ controlSimTrace
-                                  (explorationStepTimelimit opts) control mainAction
+                                  (explorationStepTimelimit opts)
+                                  control
+                                  (explorationRacyByLabel opts)
+                                  mainAction
           (sleeper,trace) = compareTraces passingTrace trace0
       in   counterexample ("Schedule control: " ++ show control)
          ( counterexample
@@ -671,7 +677,10 @@ replaySimTrace :: forall a test. (Testable test)
                -> Property
 replaySimTrace opts mainAction control k =
   let (_,trace) = detachTraceRaces (explorationDebugLevel opts) $
-                  controlSimTrace (explorationStepTimelimit opts) control mainAction
+                  controlSimTrace (explorationStepTimelimit opts)
+                                  control
+                                  (explorationRacyByLabel opts)
+                                  mainAction
   in property (k trace)
 
 -- | Run a simulation using a given schedule.  This is useful to reproduce
@@ -685,11 +694,13 @@ controlSimTrace :: forall a.
                 -- ^ a schedule to replay
                 --
                 -- /note/: must be either `ControlDefault` or `ControlAwait`.
+                -> (Maybe ThreadLabel -> Bool)
+                -- ^ See `explorationRacyByLabel`.
                 -> (forall s. IOSim s a)
                 -- ^ a simulation to run
                 -> SimTrace a
-controlSimTrace limit control main =
-    runST (IOSimPOR.controlSimTraceST limit control main)
+controlSimTrace limit control racyByLabel main =
+    runST (IOSimPOR.controlSimTraceST limit control racyByLabel main)
 
 --
 -- Utils

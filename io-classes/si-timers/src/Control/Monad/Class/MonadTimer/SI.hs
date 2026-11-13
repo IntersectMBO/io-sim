@@ -161,9 +161,8 @@ defaultRegisterDelay :: forall m timeout.
                      -> m (TVar m Bool)
 defaultRegisterDelay newTimeout awaitTimeout d = do
     c <- getMonotonicTime
-    v <- atomically $ newTVar False
-    tid <- forkIO $ go v c (d `addTime` c)
-    labelThread tid "delay-thread"
+    v <- newTVarIO False
+    _ <- forkLabelledIO "register-delay-thread" $ go v c (d `addTime` c)
     return v
   where
     maxDelay :: DiffTime
@@ -210,8 +209,7 @@ defaultRegisterDelayCancellable newTimeout _readTimeout _cancelTimeout awaitTime
     c <- getMonotonicTime
     -- timeout state
     v <- newTVarIO TimeoutPending
-    tid <- forkIO $ go v c (d `addTime` c)
-    labelThread tid "delay-thread"
+    _ <- forkLabelledIO "register-delay-thread" $ go v c (d `addTime` c)
     let cancel = atomically $ readTVar v >>= \case
           TimeoutCancelled -> return ()
           TimeoutFired     -> return ()
