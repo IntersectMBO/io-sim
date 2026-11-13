@@ -110,12 +110,21 @@ racingEffects e e' =
        -- concurrent writes to the same TVars
     || effectWrites e `intersects`  effectWrites e'
 
+       -- one effect wakes up a thread which the other one throws to: the
+       -- order decides if the exception finds the thread blocked, hence
+       -- interruptible even if it is masked
+    || effectWakeup e  `intersectsSL` effectThrows e'
+    || effectWakeup e' `intersectsSL` effectThrows e
+
   where
     intersects :: Ord a => Set a -> Set a -> Bool
     intersects a b = not $ a `Set.disjoint` b
 
     intersectsL :: Eq a => [a] -> [a] -> Bool
     intersectsL a b = not $ null $ a `List.intersect` b
+
+    intersectsSL :: Ord a => Set a -> [a] -> Bool
+    intersectsSL a b = any (`Set.member` a) b
 
 
 ---

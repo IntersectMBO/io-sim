@@ -53,7 +53,7 @@ import Data.List qualified as List
 import Data.List.Trace qualified as Trace
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (mapMaybe)
+import Data.Maybe (catMaybes, isJust, mapMaybe)
 import Data.Ord
 import Data.Set (Set)
 import Data.Set qualified as Set
@@ -103,6 +103,10 @@ data Thread s a = Thread {
     threadStep    :: !Int,
     threadVClock  :: VectorClock,
     threadEffect  :: Effect,  -- in the current step
+    -- | The `TVar`s read by the STM transaction the thread is blocked on.  Only
+    -- valid while the thread is `BlockedOnSTM`: it is not cleared when the
+    -- thread wakes up.
+    threadWaitsOn :: !(Set (Labelled TVarId)),
     threadRacy    :: !Bool
   }
   deriving Show
@@ -122,11 +126,10 @@ threadStepId Thread{ threadId, threadStep } = (threadId, threadStep)
 
 isRacyThreadId :: IOSimThreadId -> Bool
 isRacyThreadId (RacyThreadId _) = True
-isRacyThreadId _                = True
+isRacyThreadId (ThreadId _)     = False
 
 isNotRacyThreadId :: IOSimThreadId -> Bool
-isNotRacyThreadId (ThreadId _) = True
-isNotRacyThreadId _            = False
+isNotRacyThreadId = not . isRacyThreadId
 
 bottomVClock :: VectorClock
 bottomVClock = VectorClock Map.empty
@@ -353,20 +356,17 @@ schedule thread@Thread{
           -- as the timeout expired, this will be a race condition. That's why
           -- we have the locks to solve this.
 
-          -- We cannot do `tryPutMVar` in the `treadAction`, because we need to
-          -- know if the `lock` is empty right now when we still have the frame.
-          v <- execTryPutTMVar lock undefined
-          let -- Kill the assassin throwing thread then unmask exceptions and
-              -- carry on the continuation
-              threadAction :: IOSim s ()
-              threadAction =
-                if v then unsafeUnregisterTimeout tmid
-                     else atomically (takeTMVar lock) >>= killThread
-
-              thread' =
+          cleanup <-
+                maybe (unsafeUnregisterTimeout tmid)
+                      killThread
+            <$> closeTimeoutLock (TimeoutLock tmid lock)
+          -- If the assassin has already thrown, but we were not
+          -- interruptible, its exception is pending.  `cleanup` kills the
+          -- assassin, which cancels its `throwTo` and retracts the pending
+          -- exception (see `dropThrowToFrom`).
+          let thread' =
                 thread { threadControl =
-                          ThreadControl (case threadAction of
-                                          IOSim k' -> k' (\() -> k (Just x)))
+                          ThreadControl (unIOSim cleanup (\() -> k (Just x)))
                                         ctl'
                        }
           schedule thread' simstate
@@ -378,22 +378,89 @@ schedule thread@Thread{
 
       Throw e -> case unwindControlStack e thread timers of
         -- Found a CatchFrame
-        (Right thread0@Thread { threadMasking = maskst' }, timers'') -> do
-          -- We found a suitable exception handler, continue with that
+        (Right thread0@Thread { threadControl = ThreadControl handlerAction handlerCtl
+                              , threadMasking = maskst'
+                              , threadThrowTo
+                              }, timers'', locks) -> do
+          -- We found a suitable exception handler, continue with that,
+          -- but first cleanup all unwound `TimeoutFrame`s.
           -- We record a step, in case there is no exception handler on replay.
-          let (thread', eff)  = stepThread thread0
+          tids <- traverse closeTimeoutLock locks
+          let -- at least one assassin thread won the race
+              assassin = isJust `any` tids
+
+              cleanups :: IOSim s ()
+              cleanups = traverse_ killThread (catMaybes tids)
+
+              -- NOTE: we could always run the cleanups within
+              -- `uninterruptibleMask_` (as GHC's `cleanupTimeout` does), but
+              -- every `MaskFrame` pop is a step, so it would change the step
+              -- numbering of every caught exception.  We only wrap it when it
+              -- matters.
+              --
+              -- When the wrapped cleanups end, the thread unmasks back to
+              -- `maskst'`, which raises a pending async exception if the thread
+              -- is `Unmasked`.
+              needMask =
+                case maskst' of
+                  -- the thread is not blocked, thus it is interruptible iff it
+                  -- is `Unmasked`
+                  Unmasked
+                    -- at least one assassin won the race: kill all of them
+                    -- (including the ones that are blocked on `throwTo`, or not
+                    -- thrown yet) before any assassin's async exception is
+                    -- delivered.  Unlike in `IOSim`, `killThread` yields, so
+                    -- without the mask an assassin which holds its lock, but
+                    -- is not killed yet, could throw in the middle of the
+                    -- cleanups.
+                    |  assassin
+                    -> True
+
+                    -- there are pending async exceptions: don't raise any of
+                    -- them until cleanup ends
+                    |  not (null threadThrowTo)
+                    -> True
+
+                  -- otherwise none of the cleanups will be interrupted: either
+                  -- the thread is masked, and the cleanups do not block (the
+                  -- assassin threads are never masked, so `killThread` from
+                  -- any of the cleanups is non-blocking), or no assassin won
+                  -- the race, so the cleanups only unregister the timeouts,
+                  -- and neither block nor yield.
+                  _ -> False
+              thread1 =
+                if needMask
+                  -- unlike in `IOSim` case we apply masking directly.  Using
+                  -- `uninterruptibleMask_` would add a scheduling point before
+                  -- the `uninterruptibleMask_` is entered when a pending async
+                  -- can be delivered.
+                  then
+                    thread0 { threadMasking = MaskedUninterruptible
+                            , threadControl = ThreadControl
+                                                (runIOSim cleanups)
+                                                (MaskFrame (\() -> handlerAction) maskst' handlerCtl)
+                            }
+                  else
+                    thread0 { threadControl = ThreadControl
+                                                (unIOSim cleanups (\() -> handlerAction))
+                                                handlerCtl
+                            }
+              (thread', eff)  = stepThread thread1
               control'        = advanceControl (threadStepId thread0) control
               races'          = updateRaces thread0 simstate
-          trace <- schedule thread' simstate{ races = races',
-                                              control = control',
-                                              timers = timers'' }
+          trace <- schedule thread'
+                            simstate{ races = races',
+                                      control = control',
+                                      timers = timers'' }
           return (SimPORTrace time tid tstep tlbl (EventThrow e) $
                   SimPORTrace time tid tstep tlbl (EventMask maskst') $
+                  traceMany [ (time, tid, tstep, tlbl, EventMask MaskedUninterruptible)
+                            | needMask ] $
                   SimPORTrace time tid tstep tlbl (EventEffect vClock eff) $
-                  SimPORTrace time tid tstep tlbl (EventRaces races')
+                  SimPORTrace time tid tstep tlbl (EventRaces races') $
                   trace)
 
-        (Left isMain, timers'')
+        (Left isMain, timers'', locks)
           -- We unwound and did not find any suitable exception handler, so we
           -- have an unhandled exception at the top level of the thread.
           | isMain -> do
@@ -405,9 +472,15 @@ schedule thread@Thread{
                     TraceMainException time (Labelled tid tlbl) e (labelledThreads threads))
 
           | otherwise -> do
-            -- An unhandled exception in any other thread terminates the thread
+            -- An unhandled exception in any other thread terminates the thread.
+            -- Close the locks.  We don't need to kill the assassins which hold
+            -- them: throwing to a terminated thread is a no-op, and a `throwTo`
+            -- blocked on it is woken up by `deschedule Terminated`.
+            traverse_ closeTimeoutLock locks
             let terminated = Terminated
-            !trace <- deschedule terminated thread simstate { timers = timers'' }
+            !trace <- deschedule terminated
+                                 thread
+                                 simstate { timers = timers'' }
             return $ SimPORTrace time tid tstep tlbl (EventThrow e)
                    $ SimPORTrace time tid tstep tlbl (EventThreadUnhandled e)
                    $ SimPORTrace time tid tstep tlbl (EventDeschedule terminated)
@@ -496,7 +569,9 @@ schedule thread@Thread{
                                                  (TimeoutFrame nextTmid lock k ctl)
                                 }
         trace <- deschedule Yield thread' simstate { timers   = timers'
-                                                    , nextTmid = succ nextTmid }
+                                                   , nextTmid = succ nextTmid
+                                                   , nextVid  = succ nextVid
+                                                   }
         return (SimPORTrace time tid tstep tlbl (EventTimeoutCreated nextTmid tid expiry) trace)
 
       UnregisterTimeout tmid k -> do
@@ -586,7 +661,7 @@ schedule thread@Thread{
                              , threadEffect  = effect'
                              }
             (unblocked,
-             simstate') = unblockThreads False vClock wakeup simstate
+             simstate') = unblockThreads True vClock wakeup simstate
         modifySTRef (tvarVClock tvar)  (leastUpperBoundVClock vClock)
         !trace <- deschedule Yield thread' simstate' { timers = timers' }
         return $ SimPORTrace time tid tstep tlbl (EventTimerCancelled tmid)
@@ -607,9 +682,8 @@ schedule thread@Thread{
 
       Fork a k -> do
         let nextTId = threadNextTId thread
-            tid' | threadRacy thread = setRacyThread $ childThreadId tid nextTId
-                 | otherwise         = childThreadId tid nextTId
-            thread'  = thread { threadControl = ThreadControl (k tid') ctl,
+            tid'    = childThreadId (threadRacy thread) tid nextTId
+            thread' = thread { threadControl = ThreadControl (k tid') ctl,
                                 threadNextTId = nextTId + 1,
                                 threadEffect  = effect
                                              <> forkEffect tid'
@@ -627,6 +701,7 @@ schedule thread@Thread{
                               , threadVClock  = insertVClock tid' 0
                                               $ vClock
                               , threadEffect  = mempty
+                              , threadWaitsOn = Set.empty
                               , threadRacy    = threadRacy thread
                               }
             threads' = Map.insert tid' thread'' threads
@@ -638,74 +713,75 @@ schedule thread@Thread{
                $ SimPORTrace time tid tstep tlbl (EventDeschedule Yield)
                $ trace
 
-      Atomically a k -> execAtomically time tid tlbl nextVid (runSTM a) $ \res ->
-        case res of
-          StmTxCommitted x written read created
-                           tvarDynamicTraces tvarStringTraces nextVid' -> do
-            (wakeup, wokeby) <- threadsUnblockedByWrites written
-            mapM_ (\(SomeTVar tvar) -> unblockAllThreadsFromTVar tvar) written
-            vClockRead <- leastUpperBoundTVarVClocks read
-            read' <- mapM someTVarToLabelled read
-            written' <- mapM someTVarToLabelled written
-            let vClock'     = vClock `leastUpperBoundVClock` vClockRead
-                effect'     = effect
-                           <> readEffects read'
-                           <> writeEffects written'
-                           <> wakeupEffects unblocked
-                thread'     = thread { threadControl = ThreadControl (k x) ctl,
-                                       threadVClock  = vClock',
-                                       threadEffect  = effect' }
-                (unblocked,
-                 simstate') = unblockThreads True vClock' wakeup simstate
-            sequence_ [ modifySTRef (tvarVClock r) (leastUpperBoundVClock vClock')
-                      | SomeTVar r <- created ++ written ]
-            written'' <- traverse (\(SomeTVar tvar) -> labelledTVarId tvar) written
-            created' <- traverse (\(SomeTVar tvar) -> labelledTVarId tvar) created
-            -- We deschedule a thread after a transaction... another may have woken up.
-            !trace <- deschedule Yield thread' simstate' { nextVid  = nextVid' }
-            return $
-              SimPORTrace time tid tstep tlbl (EventTxCommitted written'' created' (Just effect')) $
-              traceMany
-                [ (time, tid', (-1), tlbl', EventTxWakeup vids')
-                | tid' <- unblocked
-                , let tlbl' = lookupThreadLabel tid' threads
-                , let Just vids' = Set.toList <$> Map.lookup tid' wokeby ] $
-              traceMany
-                [ (time, tid, tstep, tlbl, EventLog tr)
-                | tr <- tvarDynamicTraces
-                ] $
-              traceMany
-                [ (time, tid, tstep, tlbl, EventSay str)
-                | str <- tvarStringTraces
-                ] $
-              SimPORTrace time tid tstep tlbl (EventUnblocked unblocked) $
-              SimPORTrace time tid tstep tlbl (EventDeschedule Yield) $
-                trace
+      Atomically a k -> execAtomically time tid tlbl nextVid (runSTM a) $ \case
+        StmTxCommitted x written read created
+                         tvarDynamicTraces tvarStringTraces nextVid' -> do
+          (wakeup, wokeby) <- threadsUnblockedByWrites written
+          mapM_ (\(SomeTVar tvar) -> unblockAllThreadsFromTVar tvar) written
+          vClockRead <- leastUpperBoundTVarVClocks read
+          read' <- mapM someTVarToLabelled read
+          written' <- mapM someTVarToLabelled written
+          let vClock'     = vClock `leastUpperBoundVClock` vClockRead
+              effect'     = effect
+                         <> readEffects read'
+                         <> writeEffects written'
+                         <> wakeupEffects unblocked
+              thread'     = thread { threadControl = ThreadControl (k x) ctl,
+                                     threadVClock  = vClock',
+                                     threadEffect  = effect' }
+              (unblocked,
+               simstate') = unblockThreads True vClock' wakeup simstate
+          sequence_ [ modifySTRef (tvarVClock r) (leastUpperBoundVClock vClock')
+                    | SomeTVar r <- created ++ written ]
+          written'' <- traverse (\(SomeTVar tvar) -> labelledTVarId tvar) written
+          created' <- traverse (\(SomeTVar tvar) -> labelledTVarId tvar) created
+          -- We deschedule a thread after a transaction... another may have woken up.
+          !trace <- deschedule Yield thread' simstate' { nextVid  = nextVid' }
+          return $
+            SimPORTrace time tid tstep tlbl (EventTxCommitted written'' created' (Just effect')) $
+            traceMany
+              [ (time, tid', (-1), tlbl', EventTxWakeup vids')
+              | tid' <- unblocked
+              , let tlbl' = lookupThreadLabel tid' threads
+              , let Just vids' = Set.toList <$> Map.lookup tid' wokeby ] $
+            traceMany
+              [ (time, tid, tstep, tlbl, EventLog tr)
+              | tr <- tvarDynamicTraces
+              ] $
+            traceMany
+              [ (time, tid, tstep, tlbl, EventSay str)
+              | str <- tvarStringTraces
+              ] $
+            SimPORTrace time tid tstep tlbl (EventUnblocked unblocked) $
+            SimPORTrace time tid tstep tlbl (EventDeschedule Yield) $
+              trace
 
-          StmTxAborted read e -> do
-            -- schedule this thread to immediately raise the exception
-            vClockRead <- leastUpperBoundTVarVClocks read
-            read' <- mapM someTVarToLabelled read
-            let effect' = effect <> readEffects read'
-                thread' = thread { threadControl = ThreadControl (Throw e) ctl,
-                                   threadVClock  = vClock `leastUpperBoundVClock` vClockRead,
-                                   threadEffect  = effect' }
-            trace <- schedule thread' simstate
-            return $ SimPORTrace time tid tstep tlbl (EventTxAborted (Just effect'))
-                   $ trace
+        StmTxAborted read e -> do
+          -- schedule this thread to immediately raise the exception
+          vClockRead <- leastUpperBoundTVarVClocks read
+          read' <- mapM someTVarToLabelled read
+          let effect' = effect <> readEffects read'
+              thread' = thread { threadControl = ThreadControl (Throw e) ctl,
+                                 threadVClock  = vClock `leastUpperBoundVClock` vClockRead,
+                                 threadEffect  = effect' }
+          trace <- schedule thread' simstate
+          return $ SimPORTrace time tid tstep tlbl (EventTxAborted (Just effect'))
+                 $ trace
 
-          StmTxBlocked read -> do
-            mapM_ (\(SomeTVar tvar) -> blockThreadOnTVar tid tvar) read
-            vids <- traverse (\(SomeTVar tvar) -> labelledTVarId tvar) read
-            vClockRead <- leastUpperBoundTVarVClocks read
-            read' <- mapM someTVarToLabelled read
-            let effect' = effect <> readEffects read'
-                thread' = thread { threadVClock  = vClock `leastUpperBoundVClock` vClockRead,
-                                   threadEffect  = effect' }
-            !trace <- deschedule (Blocked BlockedOnSTM) thread' simstate
-            return $ SimPORTrace time tid tstep tlbl (EventTxBlocked vids (Just effect'))
-                   $ SimPORTrace time tid tstep tlbl (EventDeschedule (Blocked BlockedOnSTM))
-                   $ trace
+        StmTxBlocked read -> do
+          mapM_ (\(SomeTVar tvar) -> blockThreadOnTVar tid tvar) read
+          vids <- traverse (\(SomeTVar tvar) -> labelledTVarId tvar) read
+          vClockRead <- leastUpperBoundTVarVClocks read
+          read' <- mapM someTVarToLabelled read
+          let readEffect = readEffects read'
+              effect' = effect <> readEffect
+              thread' = thread { threadVClock  = vClock `leastUpperBoundVClock` vClockRead,
+                                 threadEffect  = effect',
+                                 threadWaitsOn = effectReads readEffect }
+          !trace <- deschedule (Blocked BlockedOnSTM) thread' simstate
+          return $ SimPORTrace time tid tstep tlbl (EventTxBlocked vids (Just effect'))
+                 $ SimPORTrace time tid tstep tlbl (EventDeschedule (Blocked BlockedOnSTM))
+                 $ trace
 
       GetThreadId k -> do
         let thread' = thread { threadControl = ThreadControl (k tid) ctl }
@@ -771,7 +847,8 @@ schedule thread@Thread{
       ThrowTo e tid' k -> do
         let thread'    = thread { threadControl = ThreadControl k ctl,
                                   threadEffect  = effect <> throwToEffect tid'
-                                                         <> wakeUpEffect,
+                                                         <> wakeUpEffect
+                                                         <> interruptEffect,
                                   threadVClock  = vClock `leastUpperBoundVClock` vClockTgt
                                 }
             (vClockTgt,
@@ -781,18 +858,41 @@ schedule thread@Thread{
                            not (threadInterruptible t || isThreadDone t))
               where Just t = Map.lookup tid' threads
 
+            -- If the exception interrupts a blocked transaction, this step
+            -- races with writes to the `TVar`s the transaction waits on: if
+            -- one of them wakes the thread up first, the exception finds it
+            -- runnable, and if it is masked, not interruptible.
+            interruptEffect
+              | not willBlock
+              , Just Thread { threadStatus  = ThreadBlocked BlockedOnSTM
+                            , threadWaitsOn = tvars }
+                  <- Map.lookup tid' threads
+              = mempty { effectReads = tvars }
+              | otherwise
+              = mempty
+
         if willBlock
-          then do
-            -- The target thread has async exceptions masked so we add the
-            -- exception and the source thread id to the pending async exceptions.
-            let adjustTarget t =
-                  t { threadThrowTo = (e, Labelled tid tlbl, vClock) : threadThrowTo t }
-                threads'       = Map.adjust adjustTarget tid' threads
-            trace <- deschedule (Blocked BlockedOnThrowTo) thread' simstate { threads = threads' }
-            return $ SimPORTrace time tid tstep tlbl (EventThrowTo e tid')
-                   $ SimPORTrace time tid tstep tlbl EventThrowToBlocked
-                   $ SimPORTrace time tid tstep tlbl (EventDeschedule (Blocked BlockedOnThrowTo))
-                   $ trace
+          then case threadThrowTo thread of
+            -- `throwTo` blocks, which is an interruptible point: if we have
+            -- pending async exceptions, and are not `MaskedUninterruptible`,
+            -- one of them is raised instead, and `e` is neither thrown nor
+            -- traced.  We keep the throw effect: whether `e` is thrown depends
+            -- on the masking state of the target.
+            _ : _ | maskst /= MaskedUninterruptible -> do
+              trace <- schedulePendingThrowToAndDeschedule thread' simstate
+              return $ SimPORTrace time tid tstep tlbl (EventDeschedule Interruptable)
+                     $ trace
+            _ -> do
+              -- The target thread has async exceptions masked so we add the
+              -- exception and the source thread id to the pending async exceptions.
+              let adjustTarget t =
+                    t { threadThrowTo = (e, Labelled tid tlbl, vClock) : threadThrowTo t }
+                  threads'       = Map.adjust adjustTarget tid' threads
+              trace <- deschedule (Blocked BlockedOnThrowTo) thread' simstate { threads = threads' }
+              return $ SimPORTrace time tid tstep tlbl (EventThrowTo e tid')
+                     $ SimPORTrace time tid tstep tlbl EventThrowToBlocked
+                     $ SimPORTrace time tid tstep tlbl (EventDeschedule (Blocked BlockedOnThrowTo))
+                     $ trace
           else do
             -- The target thread has async exceptions unmasked, or is masked but
             -- is blocked (and all blocking operations are interruptible) then we
@@ -802,20 +902,78 @@ schedule thread@Thread{
             -- be resolved if the thread terminates or if it leaves the exception
             -- handler (when restoring the masking state would trigger the any
             -- new pending async exception).
-            let adjustTarget t@Thread{ threadControl = ThreadControl _ ctl',
+            --
+            -- If the target thread is blocked in `throwTo`, interrupting it
+            -- cancels its `throwTo`: we drop its exception from the pending
+            -- async exceptions of its target, which might be this thread.
+            --
+            -- The target thread is `MaskedInterruptible`, to make subsequent
+            -- `throwTo` to that thread blocking, otherwise they will again
+            -- again land in this branch and overwrite a pending throw.  When the
+            -- `e` is thrown, the masking state is restored.
+            let adjustTarget :: Thread s a -> Thread s a
+                adjustTarget t@Thread{ threadControl = ThreadControl _ ctl',
+                                       threadMasking = maskst',
                                        threadVClock  = vClock' } =
-                  t { threadControl = ThreadControl (Throw e) ctl'
-                    , threadStatus  = if isThreadDone t
-                                      then threadStatus t
-                                      else ThreadRunning
-                    , threadVClock  = vClock' `leastUpperBoundVClock` vClock }
-                (_unblocked, simstate'@SimState { threads = threads' }) = unblockThreads False vClock [tid'] simstate
+                  if isThreadDone t
+                    then
+                      t { threadControl = ThreadControl (Throw e) ctl'
+                        , threadVClock  = vClock' `leastUpperBoundVClock` vClock
+                        }
+                    else
+                      t { threadControl = ThreadControl (Throw e)
+                                                        (MaskFrame Return maskst' ctl')
+                        , threadMasking = MaskedInterruptible
+                        , threadStatus  = ThreadRunning
+                        , threadVClock  = vClock' `leastUpperBoundVClock` vClock
+                        }
+
+                cancelThrowTo :: Bool
+                cancelThrowTo = case Map.lookup tid' threads of
+                  Just Thread { threadStatus = ThreadBlocked BlockedOnThrowTo }
+                    -> True
+                  _ -> False
+
+                -- the other threads whose pending async exceptions change:
+                -- this step races with their steps
+                cancelledTargets :: [IOSimThreadId]
+                cancelledTargets =
+                  [ threadId t
+                  | cancelThrowTo
+                  , t <- Map.elems threads
+                  , not (isThreadDone t)
+                  , any (\(_, Labelled tid'' _, _) -> tid'' == tid')
+                        (threadThrowTo t)
+                  ]
+
+                thread''
+                  | cancelThrowTo = (dropThrowToFrom tid' thread')
+                                      { threadEffect = threadEffect thread'
+                                                    <> foldMap throwToEffect cancelledTargets
+                                      }
+                  | otherwise     = thread'
+
+                -- the targets whose pending async exceptions change happen
+                -- after this step
+                cancelThrowToAt :: Thread s a -> Thread s a
+                cancelThrowToAt t
+                  | threadId t `elem` cancelledTargets
+                  = (dropThrowToFrom tid' t)
+                      { threadVClock = threadVClock t `leastUpperBoundVClock` vClock }
+                  | otherwise
+                  = t
+
+                simstate0
+                  | cancelThrowTo = simstate { threads = Map.map cancelThrowToAt threads }
+                  | otherwise     = simstate
+                simstate'@SimState { threads = threads' }
+                           = snd (unblockThreads False vClock [tid'] simstate0)
                 threads''  = Map.adjust adjustTarget tid' threads'
                 simstate'' = simstate' { threads = threads'' }
 
             -- We yield at this point because the target thread may be higher
             -- priority, so this should be a step for race detection.
-            trace <- deschedule Yield thread' simstate''
+            trace <- deschedule Yield thread'' simstate''
             return $ SimPORTrace time tid tstep tlbl (EventThrowTo e tid')
                    $ trace
 
@@ -883,40 +1041,13 @@ deschedule Yield thread@Thread { threadId     = tid,
                           races    = races',
                           control  = control' }
 
-deschedule Interruptable thread@Thread {
-                           threadId      = tid,
-                           threadStep    = tstep,
-                           threadControl = ThreadControl _ ctl,
-                           threadMasking = Unmasked,
-                           threadThrowTo = (e, tid', vClock') : etids,
-                           threadLabel   = tlbl,
-                           threadVClock  = vClock,
-                           threadEffect  = effect
-                         }
-                        simstate@SimState{ curTime = time, threads } = do
-
-    let effect' = effect <> wakeupEffects unblocked
-        -- We're unmasking, but there are pending blocked async exceptions.
-        -- So immediately raise the exception and unblock the blocked thread
-        -- if possible.
-        thread' = thread { threadControl = ThreadControl (Throw e) ctl
-                         , threadMasking = MaskedInterruptible
-                         , threadThrowTo = etids
-                         , threadVClock  = vClock `leastUpperBoundVClock` vClock'
-                         , threadEffect  = effect'
-                         }
-        (unblocked,
-         simstate') = unblockThreads False vClock [l_labelled tid'] simstate
-    -- the thread is stepped when we Yield
-    !trace <- deschedule Yield thread' simstate'
-    return $ SimPORTrace time tid tstep tlbl (EventThrowToUnmasked tid')
-           $ SimPORTrace time tid tstep tlbl (EventEffect vClock effect')
-           -- TODO: step
-           $ traceMany [ (time, tid'', (-1), tlbl'', EventThrowToWakeup)
-                       | tid'' <- unblocked
-                       , let tlbl'' = lookupThreadLabel tid'' threads ]
-           $ SimPORTrace time tid tstep tlbl (EventDeschedule Yield)
-             trace
+deschedule Interruptable thread@Thread { threadMasking = Unmasked
+                                       , threadThrowTo = _ : _ }
+                         simstate =
+    -- We're unmasking, but there are pending blocked async exceptions.
+    -- So immediately raise the exception and unblock the blocked thread
+    -- if possible.
+    schedulePendingThrowToAndDeschedule thread simstate
 
 deschedule Interruptable thread@Thread{threadId     = tid,
                                        threadStep   = tstep,
@@ -949,7 +1080,7 @@ deschedule (Blocked _blockedReason) thread@Thread { threadId      = tid
     -- exceptions. So immediately raise the exception and unblock the blocked
     -- thread if possible.
     SimPORTrace time tid tstep tlbl (EventDeschedule Interruptable) <$>
-      deschedule Interruptable thread { threadMasking = Unmasked } simstate
+      schedulePendingThrowToAndDeschedule thread simstate
 
 deschedule (Blocked blockedReason) thread@Thread{ threadId     = tid,
                                                   threadStep   = tstep,
@@ -1006,6 +1137,70 @@ deschedule Sleep thread@Thread { threadId = tid , threadEffect = effect' }
     let runqueue' = insertThread thread runqueue
         threads'  = Map.insert tid thread threads in
     reschedule simstate { runqueue = runqueue', threads  = threads' }
+
+-- | Raise the first pending async exception of a thread, and unblock the
+-- thread which threw it.
+--
+schedulePendingThrowToAndDeschedule
+  :: Thread s a
+  -> SimState s a
+  -> ST s (SimTrace a)
+schedulePendingThrowToAndDeschedule thread@Thread {
+                      threadId      = tid,
+                      threadStep    = tstep,
+                      threadControl = ThreadControl _ ctl,
+                      threadMasking = maskst,
+                      threadThrowTo = (e, tid', vClock') : etids,
+                      threadLabel   = tlbl,
+                      threadVClock  = vClock,
+                      threadEffect  = effect
+                    }
+                    simstate@SimState{ curTime = time, threads } = do
+
+    let effect' = effect <> wakeupEffects unblocked
+        -- adding `MaskFrame` to restore the masking state back to `maskst` and
+        -- set the masking state to `MaskedInterruptible`.
+        --
+        -- This makes raising the exception atomic.  It stops `throwTo` from
+        -- another thread replacing the pending `Throw e` before that
+        -- `Throw` has run. Since the thread is not blocked, `willBlock` is
+        -- `True` and the thread that issues `throwTo` is blocked before it can
+        -- modify control frame.
+        --
+        -- This differs from IOSim case, since next we run `deschedule Yield`
+        -- which might pick another thread to run before we handle `Throw e`.
+        thread' = thread { threadControl = ThreadControl (Throw e)
+                                                         (MaskFrame Return maskst ctl)
+                         , threadMasking = MaskedInterruptible
+                         , threadThrowTo = etids
+                         , threadVClock  = vClock `leastUpperBoundVClock` vClock'
+                         , threadEffect  = effect'
+                         }
+        (unblocked,
+         simstate') = unblockThreads False vClock [l_labelled tid'] simstate
+    -- the thread is stepped when we Yield
+    !trace <- deschedule Yield thread' simstate'
+    return $ SimPORTrace time tid tstep tlbl (EventThrowToUnmasked tid')
+           $ SimPORTrace time tid tstep tlbl (EventEffect vClock effect')
+           -- TODO: step
+           $ traceMany [ (time, tid'', (-1), tlbl'', EventThrowToWakeup)
+                       | tid'' <- unblocked
+                       , let tlbl'' = lookupThreadLabel tid'' threads ]
+           $ SimPORTrace time tid tstep tlbl (EventDeschedule Yield)
+             trace
+schedulePendingThrowToAndDeschedule _ _ =
+    error "IOSimPOR: schedulePendingThrowToAndDeschedule: no pending async exceptions"
+
+-- | Drop the pending async exceptions thrown by the given thread.
+--
+-- Used when a thread blocked in `throwTo` is interrupted: its `throwTo` is
+-- cancelled.  'BlockedOnThrowTo' does not record the target, but a thread is
+-- blocked in at most one `throwTo`, so it is safe to apply it to all threads.
+--
+dropThrowToFrom :: IOSimThreadId -> Thread s a -> Thread s a
+dropThrowToFrom tid t =
+    t { threadThrowTo = filter (\(_, Labelled tid' _, _) -> tid' /= tid)
+                               (threadThrowTo t) }
 
 
 -- Choose the next thread to run.
@@ -1222,17 +1417,19 @@ forkTimeoutInterruptThreads timeoutExpired simState =
                     Just t' -> t'
                     Nothing -> error ("IOSimPOR: internal error: unknown thread " ++ show tid)
               nextId   = threadNextTId t
-              tid'     = childThreadId tid nextId
+              tid'     = childThreadId (threadRacy t) tid nextId
+
+              -- assassin thread
+              action :: IOSim s ()
+              action = do
+                mtid <- myThreadId
+                v2 <- atomically $ tryPutTMVar lock mtid
+                when v2 $
+                  throwTo tid (toException (TimeoutException tmid))
+
            in ( state { threads = Map.insert tid t { threadNextTId = succ nextId } threads }
               , ( Thread { threadId      = tid',
-                           threadControl =
-                            ThreadControl
-                              (runIOSim $ do
-                                 mtid <- myThreadId
-                                 v2 <- atomically $ tryPutTMVar lock mtid
-                                 when v2 $
-                                   throwTo tid (toException (TimeoutException tmid)))
-                              ForkFrame,
+                           threadControl = ThreadControl (runIOSim action) ForkFrame,
                            threadStatus  = ThreadRunning,
                            threadMasking = Unmasked,
                            threadThrowTo = [],
@@ -1243,11 +1440,38 @@ forkTimeoutInterruptThreads timeoutExpired simState =
                            threadVClock  = insertVClock tid' 0
                                          $ threadVClock t,
                            threadEffect  = mempty,
+                           threadWaitsOn = Set.empty,
                            threadRacy    = threadRacy t
                          }
                 , lock
                 )
               )
+
+
+data TimeoutLock s =
+  TimeoutLock
+    TimeoutId
+    (TMVar (IOSim s) IOSimThreadId)
+
+
+-- | Close the lock of a `TimeoutFrame` in the step which leaves it, and
+-- return the assassin which holds it, if any.
+--
+-- We close the `lock` in `ST`, rather than in an action the thread runs
+-- later: committing a transaction yields, and the assassin could take the
+-- lock, and throw, after the frame is gone.
+--
+closeTimeoutLock
+  :: TimeoutLock s
+  -> ST s (Maybe IOSimThreadId)
+closeTimeoutLock (TimeoutLock _tmid (TMVar lock)) = do
+  v <- execReadTVar lock
+  case v of
+    -- The assassin has not taken the lock: fill it, so that it never will.
+    -- Only the constructor is ever inspected.
+    Nothing  -> execWriteTVar lock (Just undefined)
+             >> pure Nothing
+    Just tid -> pure (Just tid)
 
 
 -- | Iterate through the control stack to find an enclosing exception handler
@@ -1262,23 +1486,34 @@ unwindControlStack :: forall s a.
                    -> Timeouts s
                    -> ( Either Bool (Thread s a)
                       , Timeouts s
+                      , [TimeoutLock s]
                       )
-unwindControlStack e thread = \timeouts ->
+                   -- ^ a tuple containing:
+                   --
+                   -- * returns cleanly or on `MainFrame` / `ForkFrame`
+                   -- * timers without the timeout in the `TimeoutFrame`
+                   --   corresponding to `e`
+                   -- * timeout locks from all `TimeoutFrame`s which we unwind
+                   --
+unwindControlStack e = \thread timers ->
     case threadControl thread of
-      ThreadControl _ ctl -> unwind (threadMasking thread) ctl timeouts
+      ThreadControl _ ctl ->
+        unwind thread ctl timers []
   where
-    unwind :: forall s' c. MaskingState
+    unwind :: forall s' c.
+              Thread s a
            -> ControlStack s' c a
            -> Timeouts s
-           -> (Either Bool (Thread s' a), Timeouts s)
-    unwind _  MainFrame                 timers = (Left True, timers)
-    unwind _  ForkFrame                 timers = (Left False, timers)
-    unwind _ (MaskFrame _k maskst' ctl) timers = unwind maskst' ctl timers
+           -> [TimeoutLock s']
+           -> (Either Bool (Thread s' a), Timeouts s, [TimeoutLock s'])
+    unwind _  MainFrame                 timers locks = (Left True, timers, reverse locks)
+    unwind _  ForkFrame                 timers locks = (Left False, timers, reverse locks)
+    unwind thread (MaskFrame _k maskst' ctl) timers locks = unwind thread { threadMasking = maskst' } ctl timers locks
 
-    unwind maskst (CatchFrame handler k ctl) timers =
+    unwind thread (CatchFrame handler k ctl) timers locks =
       case fromException e of
         -- not the right type, unwind to the next containing handler
-        Nothing -> unwind maskst ctl timers
+        Nothing -> unwind thread ctl timers locks
 
         -- Ok! We will be able to continue the thread with the handler
         -- followed by the continuation after the catch
@@ -1286,10 +1521,11 @@ unwindControlStack e thread = \timeouts ->
                           -- As per async exception rules, the handler is run
                           -- masked
                          threadControl = ThreadControl (handler e')
-                                                       (MaskFrame k maskst ctl),
-                         threadMasking = atLeastInterruptibleMask maskst
+                                                       (MaskFrame k (threadMasking thread) ctl),
+                         threadMasking = atLeastInterruptibleMask (threadMasking thread)
                        }
                    , timers
+                   , reverse locks
                    )
 
     -- Either Timeout fired or the action threw an exception.
@@ -1297,19 +1533,24 @@ unwindControlStack e thread = \timeouts ->
     --   so we need to run the continuation with a Nothing value.
     -- - If the timeout action threw an exception we need to keep unwinding the
     --   control stack looking for a handler to this exception.
-    unwind maskst (TimeoutFrame tmid isLockedRef k ctl) timers =
+    unwind thread (TimeoutFrame tmid lock k ctl) timers locks =
         case fromException e of
           -- Exception came from timeout expiring
           Just (TimeoutException tmid')  | tmid == tmid' ->
-            (Right thread { threadControl = ThreadControl (k Nothing) ctl }, timers')
-            -- Exception came from a different exception
-          _ -> unwind maskst ctl timers'
+            (Right thread { threadControl = ThreadControl (k Nothing) ctl }, timers', reverse locks)
+            -- Exception came from a different exception.  The cleanup of the
+            -- lock kills the assassin, which retracts its pending exception, if
+            -- any.
+          _ -> unwind thread
+                      ctl
+                      timers'
+                      (TimeoutLock tmid lock : locks)
       where
         -- Remove the timeout associated with the 'TimeoutFrame'.
         timers' = IPSQ.delete (coerce tmid) timers
 
-    unwind maskst (DelayFrame tmid _k ctl) timers =
-        unwind maskst ctl timers'
+    unwind thread (DelayFrame tmid _k ctl) timers locks =
+        unwind thread ctl timers' locks
       where
         -- Remove the timeout associated with the 'DelayFrame'.
         timers' = IPSQ.delete (coerce tmid) timers
@@ -1376,6 +1617,7 @@ controlSimTraceST limit control mainAction =
         threadStep    = 0,
         threadVClock  = insertVClock (ThreadId []) 0 bottomVClock,
         threadEffect  = mempty,
+        threadWaitsOn = Set.empty,
         threadRacy    = False
       }
 
@@ -1606,15 +1848,6 @@ execNewTVar !tvarId !mbLabel x = do
 execWriteTVar :: TVar s a -> a -> ST s ()
 execWriteTVar TVar{tvarCurrent} = writeSTRef tvarCurrent
 {-# INLINE execWriteTVar #-}
-
-execTryPutTMVar :: TMVar (IOSim s) a -> a -> ST s Bool
-execTryPutTMVar (TMVar var) a = do
-    v <- execReadTVar var
-    case v of
-      Nothing -> execWriteTVar var (Just a)
-              >> return True
-      Just _  -> return False
-{-# INLINE execTryPutTMVar #-}
 
 saveTVar :: TVar s a -> ST s ()
 saveTVar TVar{tvarCurrent, tvarUndo} = do
