@@ -69,9 +69,9 @@ tests =
     -- , testProperty "propPermutations" propPermutations
     ]
   , testGroup "IO simulator properties"
-    [ testProperty "read/write graph (IOSim)" (withNumTests 1000 prop_stm_graph_sim)
+    [ testProperty "read/write graph (IOSim)" prop_stm_graph_sim
     , testGroup "timeouts"
-      [ testProperty "IOSim"                  (withNumTests 1000 prop_timers_ST)
+      [ testProperty "IOSim"                  prop_timers_ST
       , testProperty "IOSim: no deadlock"     prop_timeout_no_deadlock_Sim
       , testProperty "timeout"                prop_timeout
       , testProperty "timeouts"               prop_timeouts
@@ -422,7 +422,7 @@ unit_issue113_nonDep =
 propPermutations :: Int -> Property
 propPermutations n =
   traceNoDuplicates $ \addTrace ->
-  exploreSimTrace (withScheduleBound 10000) (doit n) $ \_ trace ->
+  exploreSimTrace (withRacyMainThread . withScheduleBound 10000) (doit n) $ \_ trace ->
     addTrace trace $
     let Right result = traceResult False trace
      in tabulate "Result" [show result] True
@@ -430,7 +430,6 @@ propPermutations n =
 doit :: Int -> IOSim s [Int]
 doit n = do
   r <- newTVarIO []
-  exploreRaces
   mapM_ (\i -> forkIO $ atomically $ modifyTVar r (++[i])) [1..n]
   threadDelay 1
   readTVarIO r
@@ -477,7 +476,7 @@ prop_explore_endless_simulation (Positive (Small finalTime)) =
   $ label (show (secondsToDiffTime finalTime))
   $ within 15000000 -- 15 seconds
   $ exploreSimTrace
-      id sim $ \_ trace -> do
+      withRacyMainThread sim $ \_ trace -> do
         let l = takeWhile (\(t, _, _, _) -> t < Time (secondsToDiffTime finalTime))
               . traceEvents
               $ trace
@@ -493,9 +492,7 @@ prop_explore_endless_simulation (Positive (Small finalTime)) =
       thread
 
     sim :: forall s. IOSim s Void
-    sim = do
-      exploreRaces
-      withAsync thread wait
+    sim = withAsync thread wait
 
 --
 -- IOSim reused properties
@@ -508,7 +505,7 @@ prop_explore_endless_simulation (Positive (Small finalTime)) =
 prop_stm_graph_sim :: TestThreadGraph -> Property
 prop_stm_graph_sim g =
   traceNoDuplicates $ \addTrace ->
-    exploreSimTrace id (prop_stm_graph g) $ \_ trace -> do
+    exploreSimTrace withRacyMainThread (prop_stm_graph g) $ \_ trace -> do
       addTrace trace
       $ counterexample (Trace.ppTrace show show trace) $
         case traceResult False trace of
@@ -521,7 +518,7 @@ prop_stm_graph_sim g =
 prop_timers_ST :: TestMicro -> Property
 prop_timers_ST (TestMicro xs) =
   let ds = map (realToFrac :: Micro -> DiffTime) xs
-   in exploreSimTrace id (test_timers ds) $ \_ trace ->
+   in exploreSimTrace withRacyMainThread (test_timers ds) $ \_ trace ->
         case traceResult False trace of
           Right a -> a
           Left e  -> counterexample (show e) False
@@ -552,7 +549,7 @@ prop_threadId_order_order_Sim n =
 --
 prop_mfix_purity :: Positive Int -> Property
 prop_mfix_purity (Positive n) =
-   exploreSimTrace id (mfix (return . factorial)) $ \_ trace ->
+   exploreSimTrace withRacyMainThread (mfix (return . factorial)) $ \_ trace ->
      case traceResult False trace of
        Right f -> f n === fix factorial n
        Left e  -> counterexample (show e) False
@@ -564,13 +561,14 @@ prop_mfix_purity_2 :: [Positive Int] -> Property
 prop_mfix_purity_2 as =
    -- note: both 'IOSim' expressions are equivalent using 'Monad' and
    -- 'Applicative' laws only.
-   exploreSimTrace id (join $ mfix (return . recDelay)
-                             <*> return as') (\_ trace ->
+   exploreSimTrace withRacyMainThread
+                   (join $ mfix (return . recDelay)
+                       <*> return as') (\_ trace ->
      case traceResult False trace of
        Right a -> a === expected
        Left e  -> counterexample (show e) False)
    .&&.
-   exploreSimTrace id (mfix (return . recDelay) >>= ($ as')) (\_ trace ->
+   exploreSimTrace withRacyMainThread (mfix (return . recDelay) >>= ($ as')) (\_ trace ->
      case traceResult False trace of
        Right a -> a === expected
        Left e  -> counterexample (show e) False)
@@ -603,13 +601,15 @@ prop_mfix_left_shrinking n (NonNegative d) (Positive i) =
        mn = do say ""
                threadDelay (realToFrac d)
                return n
-    in exploreSimTrace id (mfix (\rec_ -> mn >>= \a ->
+    in exploreSimTrace withRacyMainThread
+                       (mfix (\rec_ -> mn >>= \a ->
+                                 threadDelay (realToFrac d) $> a : rec_))
+                       (\_ trace1 ->
+       exploreSimTrace withRacyMainThread
+                       (mn >>= \a ->
+                           mfix (\rec_ ->
                                     threadDelay (realToFrac d) $> a : rec_))
-                          (\_ trace1 ->
-       exploreSimTrace id (mn >>= \a ->
-                              mfix (\rec_ ->
-                                       threadDelay (realToFrac d) $> a : rec_))
-                          (\_ trace2 ->
+                       (\_ trace2 ->
          case (traceResult False trace1, traceResult False trace2) of
            (Right a , Right b)  -> take i a === take i b
            (Left  e , Right _)  -> counterexample (show e) False
@@ -623,7 +623,7 @@ prop_mfix_left_shrinking n (NonNegative d) (Positive i) =
 prop_mfix_lazy :: NonEmptyList Char
                -> Property
 prop_mfix_lazy (NonEmpty env) =
-   exploreSimTrace id (withEnv (mfix . replicateHeadM)) (\_ trace ->
+   exploreSimTrace withRacyMainThread (withEnv (mfix . replicateHeadM)) (\_ trace ->
      case traceResult False trace of
        Right a -> take samples a === replicate samples (head env)
        Left e  -> counterexample (show e) False)
@@ -675,7 +675,7 @@ unit_catch_0, unit_catch_1, unit_catch_2, unit_catch_3, unit_catch_4,
 
 -- unhandled top level exception
 unit_catch_0 =
-  exploreSimTrace id example $ \_ trace ->
+  exploreSimTrace withRacyMainThread example $ \_ trace ->
     counterexample (List.intercalate "\n" $ map show $ traceEvents trace) $
     counterexample (show $ selectTraceSay trace) $
     selectTraceSay trace === ["before"]
@@ -692,15 +692,16 @@ unit_catch_0 =
 
 -- normal execution of a catch frame
 unit_catch_1 =
-  exploreSimTrace id (do catch (say "inner")
-                               (\(_e :: IOError) -> say "handler")
-                         say "after")
-                         $ \_ trace ->
+  exploreSimTrace withRacyMainThread
+                  (do catch (say "inner")
+                            (\(_e :: IOError) -> say "handler")
+                      say "after")
+                  $ \_ trace ->
     selectTraceSay trace === ["inner", "after"]
 
 -- catching an exception thrown in a catch frame
 unit_catch_2 =
-  exploreSimTrace id
+  exploreSimTrace withRacyMainThread
                   (do catch (do say "inner1"
                                 _ <- throwIO DivideByZero
                                 say "inner2")
@@ -711,7 +712,7 @@ unit_catch_2 =
 
 -- not catching an exception of the wrong type
 unit_catch_3 =
-  exploreSimTrace id
+  exploreSimTrace withRacyMainThread
                   (do catch (do say "inner"
                                 throwIO DivideByZero)
                             (\(_e :: IOError) -> say "handler")
@@ -722,7 +723,7 @@ unit_catch_3 =
 
 -- catching an exception in an outer handler
 unit_catch_4 =
-  exploreSimTrace id
+  exploreSimTrace withRacyMainThread
                   (do catch (catch (do say "inner"
                                        throwIO DivideByZero)
                                    (\(_e :: IOError) -> say "handler1"))
@@ -734,7 +735,7 @@ unit_catch_4 =
 
 -- catching an exception in the inner handler
 unit_catch_5 =
-  exploreSimTrace id
+  exploreSimTrace withRacyMainThread
                   (do catch (catch (do say "inner"
                                        throwIO DivideByZero)
                                    (\(_e :: ArithException) -> say "handler1"))
@@ -745,7 +746,7 @@ unit_catch_5 =
 
 -- catching an exception in the inner handler, rethrowing and catching in outer
 unit_catch_6 =
-  exploreSimTrace id
+  exploreSimTrace withRacyMainThread
                   (do catch (catch (do say "inner"
                                        throwIO DivideByZero)
                                    (\(e :: ArithException) -> do
@@ -786,7 +787,7 @@ unit_evaluate_0 =
     -- This property also fails if the @error@ is not caught by the sim monad
     -- and instead reaches the QuickCheck driver.
     -- property $ isLeft $ runSim $ evaluate (error "boom" :: ())
-  exploreSimTrace id (evaluate (error "boom" :: ())) $ \_ trace ->
+  exploreSimTrace withRacyMainThread (evaluate (error "boom" :: ())) $ \_ trace ->
     case traceResult False trace of
       Right _ -> counterexample "didn't fail" False
       Left _  -> property True
@@ -795,7 +796,7 @@ unit_evaluate_0 =
 -- Try works and we can pass exceptions back from threads.
 -- And terminating with an exception is reported properly.
 unit_fork_1 =
-  exploreSimTrace id example $ \_ trace ->
+  exploreSimTrace withRacyMainThread example $ \_ trace ->
     selectTraceSay trace === ["parent", "user error (oh noes!)"]
     .&&. case traceResult True trace of
           Left (FailureException e)
@@ -827,7 +828,7 @@ unit_async_1, unit_async_2, unit_async_3, unit_async_4,
 
 
 unit_async_1 =
-  exploreSimTrace id
+  exploreSimTrace withRacyMainThread
                   (do tid <- myThreadId
                       say "before"
                       throwTo tid DivideByZero
@@ -848,7 +849,7 @@ unit_async_2 =
 
 
 unit_async_3 =
-  exploreSimTrace id
+  exploreSimTrace withRacyMainThread
                   (do tid <- forkIO $ say "child"
                       threadDelay 1
                       -- child has already terminated when we throw the async exception
@@ -859,7 +860,7 @@ unit_async_3 =
 
 
 unit_async_4 =
-  exploreSimTrace id
+  exploreSimTrace withRacyMainThread
                   (do tid <- forkIO $ do
                               say "child"
                               catch (atomically retry)
@@ -874,7 +875,7 @@ unit_async_4 =
 
 
 unit_async_5 =
-  exploreSimTrace id
+  exploreSimTrace withRacyMainThread
                   (do tid <- forkIO $ mask_ $
                                do
                                  say "child"
@@ -894,7 +895,7 @@ unit_async_5 =
 
 
 unit_async_6 =
-  exploreSimTrace id
+  exploreSimTrace withRacyMainThread
                   (do tid <- forkIO $
                                mask_ $ do
                                  say "child"
@@ -909,7 +910,7 @@ unit_async_6 =
 
 
 unit_async_7 =
-  exploreSimTrace id
+  exploreSimTrace withRacyMainThread
                   (do tid <- forkIO $ do
                                uninterruptibleMask_ $ do
                                  say "child"
@@ -929,7 +930,7 @@ unit_async_7 =
 
 
 unit_async_8 =
-  exploreSimTrace id
+  exploreSimTrace withRacyMainThread
                   (uninterruptibleMask_ $ do
                      tid <- forkIO $ atomically retry
                      throwTo tid DivideByZero) $ \_ trace ->
@@ -939,7 +940,7 @@ unit_async_8 =
 
 
 unit_async_9 =
-  exploreSimTrace id
+  exploreSimTrace withRacyMainThread
                   (do tid <- forkIO $ do
                                uninterruptibleMask_ $ do
                                  say "child"
@@ -967,14 +968,14 @@ unit_async_9 =
 --
 prop_stm_referenceSim :: SomeTerm -> Property
 prop_stm_referenceSim t =
-  exploreSimTrace id (prop_stm_referenceM t) $ \_ trace ->
+  exploreSimTrace withRacyMainThread (prop_stm_referenceM t) $ \_ trace ->
     case traceResult False trace of
       Right a -> a
       Left e  -> counterexample (show e) False
 
 prop_timeout_no_deadlock_Sim :: Property
 prop_timeout_no_deadlock_Sim = -- runSimOrThrow prop_timeout_no_deadlockM
-  exploreSimTrace id prop_timeout_no_deadlockM $ \_ trace ->
+  exploreSimTrace withRacyMainThread prop_timeout_no_deadlockM $ \_ trace ->
     case traceResult False trace of
       Right a -> property a
       Left e  -> counterexample (show e) False
@@ -984,7 +985,7 @@ prop_timeout
     -> ActionDuration
     -> Property
 prop_timeout intendedTimeoutDuration intendedActionDuration =
-    exploreSimTrace id experiment $ \_ trace ->
+    exploreSimTrace withRacyMainThread experiment $ \_ trace ->
         case traceResult False trace of
           Right a -> a
           Left e  -> counterexample (show e) False
@@ -997,7 +998,7 @@ prop_timeout intendedTimeoutDuration intendedActionDuration =
 prop_timeouts
     :: [(TimeoutDuration, ActionDuration)]
     -> Property
-prop_timeouts times = exploreSimTrace id experiment $ \_ trace ->
+prop_timeouts times = exploreSimTrace withRacyMainThread experiment $ \_ trace ->
     case traceResult False trace of
       Right a -> a
       Left e  -> counterexample (show e) False
@@ -1086,7 +1087,7 @@ unit_registerDelay_threadDelay =
 
 unit_timeouts_and_async_exceptions_1 :: Property
 unit_timeouts_and_async_exceptions_1 =
-    exploreSimTrace id experiment $ \_ trace ->
+    exploreSimTrace withRacyMainThread experiment $ \_ trace ->
         counterexample (ppTrace_ trace)
       . either (\e -> counterexample (show e) False) id
       . traceResult False
@@ -1108,7 +1109,7 @@ unit_timeouts_and_async_exceptions_1 =
 
 unit_timeouts_and_async_exceptions_2 :: Property
 unit_timeouts_and_async_exceptions_2 =
-    exploreSimTrace id experiment $ \_ trace ->
+    exploreSimTrace withRacyMainThread experiment $ \_ trace ->
         counterexample (ppTrace_ trace)
       . either (\e -> counterexample (show e) False) id
       . traceResult False
@@ -1130,7 +1131,7 @@ unit_timeouts_and_async_exceptions_2 =
 
 unit_timeouts_and_async_exceptions_3 :: Property
 unit_timeouts_and_async_exceptions_3 =
-    exploreSimTrace id experiment $ \_ trace ->
+    exploreSimTrace withRacyMainThread experiment $ \_ trace ->
         counterexample (ppTrace_ trace)
       . either (\e -> counterexample (show e) False) id
       . traceResult False
@@ -1155,56 +1156,56 @@ unit_timeouts_and_async_exceptions_3 =
 
 unit_set_masking_state_ST :: MaskingState -> Property
 unit_set_masking_state_ST ms =
-  exploreSimTrace id (prop_set_masking_state ms) $ \_ trace ->
+  exploreSimTrace withRacyMainThread (prop_set_masking_state ms) $ \_ trace ->
     case traceResult False trace of
       Right a -> a
       Left e  -> counterexample (show e) False
 
 unit_unmask_ST :: MaskingState -> MaskingState -> Property
 unit_unmask_ST ms ms' =
-  exploreSimTrace id (prop_unmask ms ms') $ \_ trace ->
+  exploreSimTrace withRacyMainThread (prop_unmask ms ms') $ \_ trace ->
     case traceResult False trace of
       Right a -> a
       Left e  -> counterexample (show e) False
 
 unit_fork_masking_state_ST :: MaskingState -> Property
 unit_fork_masking_state_ST ms =
-  exploreSimTrace id (prop_fork_masking_state ms) $ \_ trace ->
+  exploreSimTrace withRacyMainThread (prop_fork_masking_state ms) $ \_ trace ->
     case traceResult False trace of
       Right a -> a
       Left e  -> counterexample (show e) False
 
 unit_fork_unmask_ST :: MaskingState -> MaskingState -> Property
 unit_fork_unmask_ST ms ms' =
-  exploreSimTrace id (prop_fork_unmask ms ms') $ \_ trace ->
+  exploreSimTrace withRacyMainThread (prop_fork_unmask ms ms') $ \_ trace ->
     case traceResult False trace of
       Right a -> a
       Left e  -> counterexample (show e) False
 
 unit_catch_throwIO_masking_state_ST :: MaskingState -> Property
 unit_catch_throwIO_masking_state_ST ms =
-  exploreSimTrace id (prop_catch_throwIO_masking_state ms) $ \_ trace ->
+  exploreSimTrace withRacyMainThread (prop_catch_throwIO_masking_state ms) $ \_ trace ->
     case traceResult False trace of
       Right a -> a
       Left e  -> counterexample (show e) False
 
 unit_catch_throwTo_masking_state_ST :: MaskingState -> Property
 unit_catch_throwTo_masking_state_ST ms =
-  exploreSimTrace id (prop_catch_throwTo_masking_state ms) $ \_ trace ->
+  exploreSimTrace withRacyMainThread (prop_catch_throwTo_masking_state ms) $ \_ trace ->
     case traceResult False trace of
       Right a -> a
       Left e  -> counterexample (show e) False
 
 unit_catch_throwTo_masking_state_async_ST :: MaskingState -> Property
 unit_catch_throwTo_masking_state_async_ST ms =
-  exploreSimTrace id (prop_catch_throwTo_masking_state_async ms) $ \_ trace ->
+  exploreSimTrace withRacyMainThread (prop_catch_throwTo_masking_state_async ms) $ \_ trace ->
     case traceResult False trace of
       Right a -> a
       Left e  -> counterexample (show e) False
 
 unit_catch_throwTo_masking_state_async_mayblock_ST :: MaskingState -> Property
 unit_catch_throwTo_masking_state_async_mayblock_ST ms =
-  exploreSimTrace id (prop_catch_throwTo_masking_state_async_mayblock ms) $ \_ trace ->
+  exploreSimTrace withRacyMainThread (prop_catch_throwTo_masking_state_async_mayblock ms) $ \_ trace ->
     case traceResult False trace of
       Right a -> a
       Left e  -> counterexample (show e) False

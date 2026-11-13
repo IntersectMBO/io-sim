@@ -34,6 +34,8 @@ module Control.Monad.IOSim
   , withBranching
   , withStepTimelimit
   , withReplay
+  , withRacyByLabel
+  , withRacyMainThread
     -- * Lift ST computations
   , liftST
     -- * Simulation time
@@ -560,7 +562,10 @@ exploreSimTrace optsf mainAction k =
       -- finished with trace.
       let (readRaces, trace0) = detachTraceRaces (explorationDebugLevel opts)
                               $ controlSimTrace
-                                  (explorationStepTimelimit opts) control mainAction
+                                  (explorationStepTimelimit opts)
+                                  control
+                                  (explorationRacyByLabel opts)
+                                  mainAction
           (sleeper,trace) = compareTraces passingTrace trace0
       in ( counterexample ("Schedule control: " ++ show control)
          $ counterexample
@@ -669,7 +674,10 @@ replaySimTrace :: forall a test. (Testable test)
                -> Property
 replaySimTrace opts mainAction control k =
   let (_,trace) = detachTraceRaces (explorationDebugLevel opts) $
-                  controlSimTrace (explorationStepTimelimit opts) control mainAction
+                  controlSimTrace (explorationStepTimelimit opts)
+                                  control
+                                  (explorationRacyByLabel opts)
+                                  mainAction
   in property (k trace)
 
 -- | Run a simulation using a given schedule.  This is useful to reproduce
@@ -683,11 +691,12 @@ controlSimTrace :: forall a.
                 -- ^ a schedule to replay
                 --
                 -- /note/: must be either `ControlDefault` or `ControlAwait`.
+                -> (Maybe String -> Bool)
                 -> (forall s. IOSim s a)
                 -- ^ a simulation to run
                 -> SimTrace a
-controlSimTrace limit control main =
-    runST (IOSimPOR.controlSimTraceST limit control main)
+controlSimTrace limit control racyByLabel main =
+    runST (IOSimPOR.controlSimTraceST limit control racyByLabel main)
 
 --
 -- Utils
