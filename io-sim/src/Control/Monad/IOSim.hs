@@ -54,6 +54,7 @@ module Control.Monad.IOSim
   , Unique
     -- ** Dynamic Tracing
   , traceM
+  , exploreRacesOfThreadsLabelled
   , traceSTM
     -- ** Pretty printers
   , ppTrace
