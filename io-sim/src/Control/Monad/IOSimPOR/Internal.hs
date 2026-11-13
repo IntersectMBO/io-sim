@@ -208,7 +208,8 @@ data SimState s a = SimState {
        control0         :: !ScheduleControl,
        -- | limit on the computation time allowed per scheduling step, for
        -- catching infinite loops etc
-       perStepTimeLimit :: Maybe Int
+       perStepTimeLimit :: Maybe Int,
+       racyByLabel      :: Maybe ThreadLabel -> Bool
 
      }
 
@@ -226,7 +227,8 @@ initialState =
       races    = noRaces,
       control  = ControlDefault,
       control0 = ControlDefault,
-      perStepTimeLimit = Nothing
+      perStepTimeLimit = Nothing,
+      racyByLabel = const False
     }
   where
     epoch1970 = UTCTime (fromGregorian 1970 1 1) 0
@@ -279,7 +281,8 @@ schedule thread@Thread{
            nextVid, nextTmid, nextUniq,
            curTime  = time,
            control,
-           perStepTimeLimit
+           perStepTimeLimit,
+           racyByLabel
          }
 
   | controlTargets (tid,tstep) control =
@@ -608,6 +611,7 @@ schedule thread@Thread{
       Fork a k -> do
         let nextTId = threadNextTId thread
             tid' | threadRacy thread = setRacyThread $ childThreadId tid nextTId
+                 | racyByLabel tlbl  = setRacyThread $ childThreadId tid nextTId
                  | otherwise         = childThreadId tid nextTId
             thread'  = thread { threadControl = ThreadControl (k tid') ctl,
                                 threadNextTId = nextTId + 1,
@@ -627,7 +631,7 @@ schedule thread@Thread{
                               , threadVClock  = insertVClock tid' 0
                                               $ vClock
                               , threadEffect  = mempty
-                              , threadRacy    = threadRacy thread
+                              , threadRacy    = isRacyThreadId tid'
                               }
             threads' = Map.insert tid' thread'' threads
         -- A newly forked thread may have a higher priority, so we deschedule this one.
@@ -1349,10 +1353,19 @@ lookupThreadLabel tid threads = join (threadLabel <$> Map.lookup tid threads)
 -- more convenient way is exposed by 'runSimTrace'.
 --
 runSimTraceST :: forall s a. IOSim s a -> ST s (SimTrace a)
-runSimTraceST mainAction = controlSimTraceST Nothing ControlDefault mainAction
+runSimTraceST mainAction =
+    controlSimTraceST
+      Nothing
+      ControlDefault
+      (const False)
+      mainAction
 
-controlSimTraceST :: Maybe Int -> ScheduleControl -> IOSim s a -> ST s (SimTrace a)
-controlSimTraceST limit control mainAction =
+controlSimTraceST :: Maybe Int
+                  -> ScheduleControl
+                  -> (Maybe String -> Bool)
+                  -> IOSim s a
+                  -> ST s (SimTrace a)
+controlSimTraceST limit control racyByLabel mainAction =
   SimPORTrace (curTime initialState)
               (threadId mainThread)
               0
@@ -1360,12 +1373,16 @@ controlSimTraceST limit control mainAction =
               (EventSimStart control)
   <$> schedule mainThread initialState { control  = control,
                                          control0 = control,
-                                         perStepTimeLimit = limit
+                                         perStepTimeLimit = limit,
+                                         racyByLabel
                                        }
   where
+    threadRacy = racyByLabel Nothing
     mainThread =
       Thread {
-        threadId      = ThreadId [],
+        threadId      = if threadRacy
+                          then RacyThreadId []
+                          else ThreadId [],
         threadControl = ThreadControl (runIOSim mainAction) MainFrame,
         threadStatus  = ThreadRunning,
         threadMasking = Unmasked,
@@ -1376,7 +1393,7 @@ controlSimTraceST limit control mainAction =
         threadStep    = 0,
         threadVClock  = insertVClock (ThreadId []) 0 bottomVClock,
         threadEffect  = mempty,
-        threadRacy    = False
+        threadRacy
       }
 
 

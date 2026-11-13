@@ -36,6 +36,8 @@ module Control.Monad.IOSim.Types
   , withBranching
   , withStepTimelimit
   , withReplay
+  , withRacyByLabel
+  , withRacyMainThread
   , stdExplorationOptions
   , EventlogEvent (..)
   , EventlogMarker (..)
@@ -1364,7 +1366,7 @@ data ExplorationOptions = ExplorationOptions{
     -- ^ A schedule to replay.
     --
     -- The default value is `Nothing`.
-    explorationDebugLevel    :: Int
+    explorationDebugLevel    :: Int,
     -- ^ Log detailed trace to stderr containing information on discovered
     -- races.  The trace does not contain the result of the simulation, unless
     -- one will do that explicitly inside the simulation.
@@ -1375,8 +1377,18 @@ data ExplorationOptions = ExplorationOptions{
     --
     -- NOTE: discovered schedules & races are not exposed to the user in the
     -- callback of `exploreSimTrace` or in the output of `controlSimTrace`.
+    explorationRacyByLabel :: Maybe String -> Bool
+    -- ^ Whenever we fork a new thread we call `explorationRacyByLabel` with the
+    -- label of the current thread.  For the main thread (which doesn't have
+    -- a parent), `Nothing` is passed.  If `True` is returned all steps of the
+    -- forked thread will take part in race discovery.  If a thread is racy,
+    -- then all its child threads are racy, regardless of the
+    -- `explorationRacyByLabel` value (e.g. racy flag is sticky).
   }
-  deriving Show
+
+instance Show ExplorationOptions where
+    show (ExplorationOptions scheduleBound branching stepTimelimit replay debugLevel _racyByLabel) =
+      show (scheduleBound, branching, stepTimelimit, replay, debugLevel)
 
 stdExplorationOptions :: ExplorationOptions
 stdExplorationOptions = ExplorationOptions{
@@ -1384,8 +1396,9 @@ stdExplorationOptions = ExplorationOptions{
     explorationBranching     = 3,
     explorationStepTimelimit = Nothing,
     explorationReplay        = Nothing,
-    explorationDebugLevel    = 0
-    }
+    explorationDebugLevel    = 0,
+    explorationRacyByLabel   = const False
+  }
 
 type ExplorationSpec = ExplorationOptions -> ExplorationOptions
 
@@ -1400,3 +1413,17 @@ withStepTimelimit n e = e{explorationStepTimelimit = Just n}
 
 withReplay :: ScheduleControl -> ExplorationSpec
 withReplay r e = e{explorationReplay = Just r}
+
+-- | All threads which are descendants of the threads that return `True` all
+-- part of the race discovery.
+--
+-- NOTE: this function is called when a thread is forked (`forkIO` & friends),
+-- you must to label the parent thread before it calls `forkIO`.
+withRacyByLabel :: (Maybe ThreadLabel -> Bool)
+                -> ExplorationSpec
+withRacyByLabel racyByLabel e = e{explorationRacyByLabel = racyByLabel}
+
+-- | All threads, including the main thread are part of race discovery.
+--
+withRacyMainThread :: ExplorationSpec
+withRacyMainThread e = e{explorationRacyByLabel = const True}
