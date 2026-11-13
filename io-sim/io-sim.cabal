@@ -83,6 +83,27 @@ library
   if flag(asserts)
      ghc-options:      -fno-ignore-asserts
 
+library qsm
+  import:              warnings
+  hs-source-dirs:      qsm
+  exposed-modules:     Test.StateMachine.IOSim.Execute
+                       Test.StateMachine.IOSim.Generate
+                       Test.StateMachine.IOSim.Types
+                       Test.StateMachine.IOSim
+
+  reexported-modules:  Test.StateMachine.Types.Rank2
+
+  build-depends:       base,
+                       io-sim,
+                       QuickCheck,
+                       mtl,
+                       containers,
+                       pretty-show,
+                       io-classes,
+                       quickcheck-state-machine:no-vendored-treediff,
+  default-extensions:  ImportQualifiedPost
+  default-language:    Haskell2010
+
 test-suite test
   import:              test-warnings
   type:                exitcode-stdio-1.0
@@ -136,3 +157,28 @@ benchmark bench
                        -Wpartial-fields
                        -Widentities
                        -Wredundant-constraints
+
+test-suite qsm-test
+  import:              test-warnings
+  type:                exitcode-stdio-1.0
+  hs-source-dirs:      qsm-test
+  main-is: Main.hs
+
+  other-modules:       BasicTest.Template
+                       BasicTest.Correct
+                       BasicTest.NoIncr
+                       BasicTest.Racy
+                       BasicTest.InternalFork
+                       BasicTest.InternalForkAtomic
+                       Exception.Deadlocks
+                       Exception.TryPutMVar
+                       Exception.WithMVar
+
+  default-language:    Haskell2010
+  default-extensions:  ImportQualifiedPost
+  build-depends:       base,
+                       io-sim:qsm,
+                       io-classes,
+                       QuickCheck,
+                       tasty,
+                       tasty-quickcheck
