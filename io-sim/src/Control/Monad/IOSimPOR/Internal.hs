@@ -550,7 +550,10 @@ schedule thread@Thread{
       UnshareClock k -> do
         let clockid   = threadClockId thread
             clockoff  = clocks Map.! clockid
-            clockid'  = let ThreadId i = tid in ClockId i -- reuse the thread id
+            -- reuse the thread id
+            clockid'  = case tid of
+                          RacyThreadId i -> ClockId i
+                          ThreadId i     -> ClockId i
             thread'   = thread { threadControl = ThreadControl k ctl
                                , threadClockId = clockid' }
             simstate' = simstate { clocks = Map.insert clockid' clockoff clocks }
