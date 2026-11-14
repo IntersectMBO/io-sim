@@ -12,6 +12,7 @@ import Control.Exception (AsyncException, ErrorCall (..))
 import Control.Monad
 
 import Control.Concurrent.Class.MonadSTM.Strict
+import Control.Monad.Class.MonadAsync
 import Control.Monad.Class.MonadFork
 import Control.Monad.Class.MonadThrow
 import Control.Monad.Class.MonadTime.SI
@@ -398,6 +399,32 @@ prop_fork_unmask ms ms' =
                                        >>= atomically . putTMVar var
         ms'' <- atomically $ takeTMVar var
         return $ Unmasked === ms''
+
+-- | Check that a thread forked by one of the `withAsync*WithUnmask` functions
+-- starts with the masking state of its parent, as in the @async@ package, and
+-- that its 'unmask' function restores 'Unmasked' state.
+--
+prop_withAsyncWithUnmask_masking_state :: forall m.
+                                          ( MonadAsync m
+                                          , MonadMask  m
+                                          )
+                                       => MaskingState -> m Property
+prop_withAsyncWithUnmask_masking_state ms =
+    setMaskingState_ ms $ do
+      rs <- sequence
+        [ ("withAsyncWithUnmask",)
+            <$> withAsyncWithUnmask child wait
+        , ("withAsyncOnWithUnmask",)
+            <$> withAsyncOnWithUnmask 0 child wait
+        ]
+      return $ conjoin
+        [ counterexample name $ r === (ms, Unmasked)
+        | (name, r) <- rs
+        ]
+  where
+    -- the masking state in which the child starts, and the one set by 'unmask'
+    child :: (forall x. m x -> m x) -> m (MaskingState, MaskingState)
+    child unmask = (,) <$> getMaskingState <*> unmask getMaskingState
 
 -- | A unit test which checks the masking state in the context of a catch
 -- handler.

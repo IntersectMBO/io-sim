@@ -127,6 +127,11 @@ tests =
     $ forall_masking_states $ \ms  ->
       forall_masking_states $ \ms' -> unit_fork_unmask_ST ms ms'
 
+    , testProperty "withAsyncWithUnmask (IO)"
+    $ forall_masking_states unit_withAsyncWithUnmask_masking_state_IO
+    , testProperty "withAsyncWithUnmask (IOSim)"
+    $ forall_masking_states unit_withAsyncWithUnmask_masking_state_ST
+
     , testProperty "catch (IO)"
     $ forall_masking_states unit_catch_throwIO_masking_state_IO
     , testProperty "catch (IOSim)"
@@ -1573,6 +1578,14 @@ unit_fork_unmask_IO ms ms' = once $ ioProperty $ prop_fork_unmask ms ms'
 
 unit_fork_unmask_ST :: MaskingState -> MaskingState -> Property
 unit_fork_unmask_ST ms ms' = once $ runSimOrThrow $ prop_fork_unmask ms ms'
+
+unit_withAsyncWithUnmask_masking_state_IO :: MaskingState -> Property
+unit_withAsyncWithUnmask_masking_state_IO = once .
+    ioProperty . prop_withAsyncWithUnmask_masking_state
+
+unit_withAsyncWithUnmask_masking_state_ST :: MaskingState -> Property
+unit_withAsyncWithUnmask_masking_state_ST ms = once $
+    runSimOrThrow (prop_withAsyncWithUnmask_masking_state ms)
 
 unit_catch_throwIO_masking_state_IO :: MaskingState -> Property
 unit_catch_throwIO_masking_state_IO ms = once $

@@ -240,13 +240,15 @@ class ( MonadSTM m
                                    `finally` uninterruptibleCancel a
 
 
+  -- the child runs in the masking state of the parent, as in the `async`
+  -- package; `asyncWithUnmask` forks it masked, since we are inside `mask`.
   withAsyncWithUnmask action inner = mask $ \restore -> do
-                                       a <- asyncWithUnmask action
+                                       a <- asyncWithUnmask (\unmask -> restore (action unmask))
                                        restore (inner a)
                                          `finally` uninterruptibleCancel a
 
   withAsyncOnWithUnmask n action inner = mask $ \restore -> do
-                                           a <- asyncOnWithUnmask n action
+                                           a <- asyncOnWithUnmask n (\unmask -> restore (action unmask))
                                            restore (inner a)
                                              `finally` uninterruptibleCancel a
 
