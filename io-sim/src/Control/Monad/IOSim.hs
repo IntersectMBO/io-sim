@@ -575,7 +575,9 @@ exploreSimTrace optsf mainAction k =
              )
          $ k passingTrace trace
          )
-      .&&| let limit     = (n+m-1) `div` m
+      -- `.&&.` must be sequential: the second property does `readRaces`,
+      -- which will only be populated when the first property is evaluated.
+      .&&. let limit     = (n+m-1) `div` m
                -- To ensure the set of schedules explored is deterministic, we
                -- filter out cached ones *after* selecting the children of this
                -- node.
