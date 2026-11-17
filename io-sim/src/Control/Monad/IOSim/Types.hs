@@ -1100,6 +1100,11 @@ data SimEventType
   -- ^ thread delayed
   | EventThreadDelayFired   TimeoutId
   -- ^ thread woken up after a delay
+  | EventPreempted          TimeoutId Int DiffTime SI.Time
+  -- ^ the thread was preempted at its n-th yield point for the given time,
+  -- until the given time
+  | EventPreemptionEnded    TimeoutId
+  -- ^ a preempted thread is runnable again
 
   | EventTimeoutCreated        TimeoutId IOSimThreadId SI.Time
   -- ^ new timeout created (via `timeout`)
@@ -1215,6 +1220,10 @@ ppSimEventType = \case
              show tid, " ",
              show t ]
   EventThreadDelayFired  tid -> "ThreadDelayFired " ++ show tid
+  EventPreempted tmid n d t ->
+    concat [ "Preempted ", show tmid, " yield ", show n, " for ", show d,
+             " until ", show t ]
+  EventPreemptionEnded tmid -> "PreemptionEnded " ++ show tmid
   EventTimeoutCreated timer tid t ->
     concat [ "TimeoutCreated ",
              show timer, " ",

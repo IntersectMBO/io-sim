@@ -14,6 +14,10 @@ module Control.Monad.IOSim.Internal
   ( IOSim (..)
   , runIOSim
   , runSimTraceST
+  , runSimTraceSTWith
+  , Preemption (..)
+  , noPreemption
+  , preemptRandom
   , traceM
   , traceSTM
   , STM
@@ -45,6 +49,7 @@ import Data.Deque.Strict (Deque)
 import Data.Deque.Strict qualified as Deque
 import Data.Dynamic
 import Data.Foldable (foldlM, toList, traverse_)
+import Data.Hashable (hashWithSalt)
 import Data.IntPSQ (IntPSQ)
 import Data.IntPSQ qualified as PSQ
 import Data.List qualified as List
@@ -55,6 +60,10 @@ import Data.Maybe (catMaybes, mapMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Time (UTCTime (..), fromGregorian)
+import Data.Time.Clock (diffTimeToPicoseconds, picosecondsToDiffTime)
+import System.Environment (lookupEnv)
+import System.IO.Unsafe (unsafePerformIO)
+import Text.Read qualified as TR
 
 import Control.Exception (NonTermination (..), SomeAsyncException, assert,
            throw)
@@ -70,7 +79,7 @@ import Control.Monad.Class.MonadSTM hiding (STM)
 import Control.Monad.Class.MonadSTM.Internal (TMVarDefault (TMVar))
 import Control.Monad.Class.MonadThrow hiding (getMaskingState)
 import Control.Monad.Class.MonadTime
-import Control.Monad.Class.MonadTimer.SI (TimeoutState (..))
+import Control.Monad.Class.MonadTimer.SI (DiffTime, TimeoutState (..))
 
 import Control.Monad.IOSim.InternalTypes
 import Control.Monad.IOSim.Types hiding (SimEvent (SimPOREvent),
@@ -126,6 +135,55 @@ data TimerCompletionInfo s =
      | TimerTimeout !IOSimThreadId !TimeoutId !(TMVar (IOSim s) IOSimThreadId)
      -- ^ `timeout` timer run by `IOSimThreadId` which was assigned the given
      -- `TimeoutId` (only used to report in a trace).
+     | TimerPreempt !IOSimThreadId !TimeoutId
+     -- ^ end of a preemption of `IOSimThreadId` (see 'Preemption').
+
+
+-- | A preemption oracle.  At each yield point of a thread (after a committed
+-- STM transaction, `yield`, or `timeout`'s setup) it is asked with the thread
+-- and the number of yield points that thread passed before this one.  When
+-- it returns a positive delay the thread is descheduled for that long, while
+-- it is runnable: other threads run and time advances.  The thread is not
+-- interruptible while preempted unless it is unmasked.
+--
+newtype Preemption = Preemption {
+    preemptAt :: IOSimThreadId -> Int -> Maybe DiffTime
+  }
+
+noPreemption :: Preemption
+noPreemption = Preemption (\_ _ -> Nothing)
+
+-- | Preempt each yield point with probability @p@, for a delay drawn
+-- uniformly from @(0, maxDelay]@ in microsecond steps.  The choice is a pure
+-- function of the seed, the thread and its yield count.
+--
+preemptRandom :: Int       -- ^ seed
+              -> Double    -- ^ probability
+              -> DiffTime  -- ^ maximal delay
+              -> Preemption
+preemptRandom seed p maxDelay = Preemption $ \tid n ->
+    let h1 = hashWithSalt seed (tid, n, False) `mod` 1_000_000
+        h2 = hashWithSalt seed (tid, n, True)
+        us = max 1 (diffTimeToPicoseconds maxDelay `div` 1_000_000)
+    in if fromIntegral h1 < p * 1_000_000
+         then Just (picosecondsToDiffTime ((1 + toInteger h2 `mod` us) * 1_000_000))
+         else Nothing
+
+-- | PROTOTYPE ONLY, for surveying existing test suites: when the environment
+-- variable @IOSIM_PREEMPT=p,maxDelayMicroseconds,seed@ is set, every
+-- 'runSimTraceST' (and so 'runSim', 'runSimTrace', ...) uses 'preemptRandom'
+-- with those parameters.
+envPreemption :: Preemption
+envPreemption = unsafePerformIO $ do
+    v <- lookupEnv "IOSIM_PREEMPT"
+    pure $ case fmap (splitOn ',') v of
+      Just [p, us, seed] -> preemptRandom (TR.read seed) (TR.read p) (fromIntegral (TR.read us :: Int) / 1_000_000)
+      _                  -> noPreemption
+  where
+    splitOn c xs = case break (== c) xs of
+      (a, [])    -> [a]
+      (a, _ : b) -> a : splitOn c b
+{-# NOINLINE envPreemption #-}
 
 
 type Timeouts s = IntPSQ Time (TimerCompletionInfo s)
@@ -133,19 +191,24 @@ type Timeouts s = IntPSQ Time (TimerCompletionInfo s)
 -- | Internal state.
 --
 data SimState s a = SimState {
-       runqueue :: !(Deque IOSimThreadId),
+       runqueue   :: !(Deque IOSimThreadId),
        -- | All threads other than the currently running thread: both running
        -- and blocked threads.
-       threads  :: !(Map IOSimThreadId (Thread s a)),
+       threads    :: !(Map IOSimThreadId (Thread s a)),
        -- | current time
-       curTime  :: !Time,
+       curTime    :: !Time,
        -- | ordered list of timers and timeouts
-       timers   :: !(Timeouts s),
+       timers     :: !(Timeouts s),
        -- | list of clocks
-       clocks   :: !(Map ClockId UTCTime),
-       nextVid  :: !VarId,     -- ^ next unused 'VarId'
-       nextTmid :: !TimeoutId, -- ^ next unused 'TimeoutId'
-       nextUniq :: !(Unique s) -- ^ next unused @'Unique' s@
+       clocks     :: !(Map ClockId UTCTime),
+       nextVid    :: !VarId,     -- ^ next unused 'VarId'
+       nextTmid   :: !TimeoutId, -- ^ next unused 'TimeoutId'
+       nextUniq   :: !(Unique s), -- ^ next unused @'Unique' s@
+       preemption :: !Preemption,
+       -- | yield points each thread passed
+       yieldCount :: !(Map IOSimThreadId Int),
+       -- | the current preemption of each preempted thread
+       preempted  :: !(Map IOSimThreadId TimeoutId)
      }
 
 initialState :: SimState s a
@@ -158,7 +221,10 @@ initialState =
       clocks   = Map.singleton (ClockId []) epoch1970,
       nextVid  = 0,
       nextTmid = TimeoutId 0,
-      nextUniq = MkUnique 0
+      nextUniq = MkUnique 0,
+      preemption = noPreemption,
+      yieldCount = Map.empty,
+      preempted  = Map.empty
     }
   where
     epoch1970 = UTCTime (fromGregorian 1970 1 1) 0
@@ -686,7 +752,7 @@ schedule !thread@Thread{
                 | cancelThrowTo = simstate { threads = Map.map (dropThrowToFrom tid') threads }
                 | otherwise     = simstate
               simstate'@SimState { threads = threads' }
-                         = snd (unblockThreads False [tid'] simstate0)
+                         = snd (unblockThreads False [tid'] (cancelPreemption tid' simstate0))
               threads''  = Map.adjust adjustTarget tid' threads'
               simstate'' = simstate' { threads = threads'' }
 
@@ -721,25 +787,35 @@ schedule !thread@Thread{
 threadInterruptible :: Thread s a -> Bool
 threadInterruptible thread =
     case threadMasking thread of
-      Unmasked              -> True
-      -- blocking operations are interruptible
-      MaskedInterruptible   -> isThreadBlocked thread
-      MaskedUninterruptible -> False
+      Unmasked                   -> True
+      MaskedInterruptible
+        | ThreadBlocked BlockedOnPreempt <- threadStatus thread
+                                 -> False -- preemption is not an operation
+        | isThreadBlocked thread -> True  -- blocking operations are interruptible
+        | otherwise              -> False
+      MaskedUninterruptible      -> False
 
 deschedule :: Deschedule -> Thread s a -> SimState s a -> ST s (SimTrace a)
-deschedule Yield !thread !simstate@SimState{runqueue, threads} =
-
-    -- We don't interrupt runnable threads to provide fairness anywhere else.
-    -- We do it here by putting the thread to the back of the runqueue, behind
-    -- all other runnable threads.
-    --
-    -- For testing, we should have a more sophisticated policy to show that
-    -- algorithms are not sensitive to the exact policy, so long as it is a
-    -- fair policy (all runnable threads eventually run).
-
-    let runqueue' = Deque.snoc (threadId thread) runqueue
-        threads'  = Map.insert (threadId thread) thread threads in
-    reschedule simstate { runqueue = runqueue', threads  = threads' }
+deschedule Yield !thread@Thread{ threadId = tid, threadLabel = tlbl }
+                 !simstate@SimState{ curTime = time, timers, nextTmid, threads,
+                                     preemption, yieldCount, preempted }
+  | Just d <- preemptAt preemption tid n
+  , d > 0 =
+    let !expiry  = d `addTime` time
+        !thread' = thread { threadStatus = ThreadBlocked BlockedOnPreempt }
+        !timers' = PSQ.insert (coerce nextTmid) expiry
+                              (TimerPreempt tid nextTmid) timers
+    in SimTrace time tid tlbl (EventPreempted nextTmid n d expiry) <$>
+       reschedule simstate { threads    = Map.insert tid thread' threads,
+                             timers     = timers',
+                             nextTmid   = succ nextTmid,
+                             yieldCount = yieldCount',
+                             preempted  = Map.insert tid nextTmid preempted }
+  | otherwise =
+    yieldThread thread simstate { yieldCount = yieldCount' }
+  where
+    !n           = Map.findWithDefault 0 tid yieldCount
+    !yieldCount' = Map.insert tid (succ n) yieldCount
 
 deschedule Interruptable !thread@Thread { threadMasking = Unmasked
                                         , threadThrowTo = _ : _ } !simstate =
@@ -767,12 +843,13 @@ deschedule (Blocked blockedReason) !thread !simstate@SimState{threads} =
         threads' = Map.insert (threadId thread') thread' threads in
     reschedule simstate { threads = threads' }
 
-deschedule Terminated !thread !simstate@SimState{ curTime = time, threads } =
+deschedule Terminated !thread !simstate@SimState{ curTime = time, threads, yieldCount } =
     -- This thread is done. If there are other threads blocked in a
     -- ThrowTo targeted at this thread then we can wake them up now.
     let !wakeup      = map (l_labelled . snd) (reverse (threadThrowTo thread))
         (unblocked,
-         !simstate') = unblockThreads False wakeup simstate
+         !simstate') = unblockThreads False wakeup
+                         simstate { yieldCount = Map.delete (threadId thread) yieldCount }
     in do
     !trace <- reschedule simstate'
     return $ traceMany
@@ -826,6 +903,23 @@ dropThrowToFrom tid t =
     t { threadThrowTo = filter (\(_, Labelled tid' _) -> tid' /= tid)
                                (threadThrowTo t) }
 
+-- | Put a runnable thread at the back of the runqueue.
+--
+yieldThread :: Thread s a -> SimState s a -> ST s (SimTrace a)
+yieldThread !thread !simstate@SimState{runqueue, threads} =
+
+    -- We don't interrupt runnable threads to provide fairness anywhere else.
+    -- We do it here by putting the thread to the back of the runqueue, behind
+    -- all other runnable threads.
+    --
+    -- For testing, we should have a more sophisticated policy to show that
+    -- algorithms are not sensitive to the exact policy, so long as it is a
+    -- fair policy (all runnable threads eventually run).
+
+    let runqueue' = Deque.snoc (threadId thread) runqueue
+        threads'  = Map.insert (threadId thread) thread threads in
+    reschedule simstate { runqueue = runqueue', threads  = threads' }
+
 -- When there is no current running thread but the runqueue is non-empty then
 -- schedule the next one to run.
 reschedule :: SimState s a -> ST s (SimTrace a)
@@ -856,10 +950,17 @@ reschedule !simstate@SimState{ threads, timers, curTime = time } =
 
             -- Check all fired threadDelays
         let wakeupThreadDelay = [ (tid, tmid) | TimerThreadDelay tid tmid <- fired ]
+            -- preemptions that are still current (a thread unmasked when
+            -- preempted may have been woken by an async exception)
+            wakeupPreempt     = [ (tid, tmid)
+                                | TimerPreempt tid tmid <- fired
+                                , Map.lookup tid (preempted simstate) == Just tmid ]
             !simstate'        =
-                snd . unblockThreads False (fst `fmap` wakeupThreadDelay)
+                snd . unblockThreads False (fst `fmap` wakeupPreempt)
+              . snd . unblockThreads False (fst `fmap` wakeupThreadDelay)
               . snd . unblockThreads True  wakeupSTM
-              $ simstate
+              $ simstate { preempted = foldr (Map.delete . fst)
+                                             (preempted simstate) wakeupPreempt }
 
             -- For each 'timeout' action where the timeout has fired, start a
             -- new thread to execute throwTo to interrupt the action.
@@ -889,6 +990,9 @@ reschedule !simstate@SimState{ threads, timers, curTime = time } =
                   ++ [ ( time', tid, Just "thread delay timer"
                        , EventThreadDelayFired tmid)
                      | (tid, tmid) <- wakeupThreadDelay ]
+                  ++ [ ( time', tid, Just "preemption timer"
+                       , EventPreemptionEnded tmid)
+                     | (tid, tmid) <- wakeupPreempt ]
                   ++ [ ( time', tid, Just "timeout timer"
                        , EventTimeoutFired tmid)
                      | (tid, tmid, _) <- timeoutExpired ]
@@ -909,6 +1013,15 @@ reschedule !simstate@SimState{ threads, timers, curTime = time } =
     -- it's handled directly above with 'wakeupThreadDelay' and 'unblockThreads'
     timeoutSTMAction TimerThreadDelay{}       = return ()
     timeoutSTMAction TimerTimeout{}           = return ()
+    timeoutSTMAction TimerPreempt{}           = return ()
+
+-- | Cancel the preemption of a thread, if it is preempted.
+cancelPreemption :: IOSimThreadId -> SimState s a -> SimState s a
+cancelPreemption tid simstate@SimState{ preempted, timers } =
+    case Map.lookup tid preempted of
+      Nothing   -> simstate
+      Just tmid -> simstate { preempted = Map.delete tid preempted
+                            , timers    = PSQ.delete (coerce tmid) timers }
 
 unblockThreads :: Bool -> [IOSimThreadId] -> SimState s a -> ([IOSimThreadId], SimState s a)
 unblockThreads !onlySTM !wakeup !simstate@SimState {runqueue, threads} =
@@ -1152,7 +1265,13 @@ lookupThreadLabel tid threads = join (threadLabel <$> Map.lookup tid threads)
 -- convenient way is exposed by 'Control.Monad.IOSim.runSimTrace'.
 --
 runSimTraceST :: forall s a. IOSim s a -> ST s (SimTrace a)
-runSimTraceST mainAction = schedule mainThread initialState
+runSimTraceST = runSimTraceSTWith envPreemption
+
+-- | 'runSimTraceST' with a preemption oracle.
+--
+runSimTraceSTWith :: forall s a. Preemption -> IOSim s a -> ST s (SimTrace a)
+runSimTraceSTWith preemption mainAction =
+    schedule mainThread initialState { preemption }
   where
     mainThread =
       Thread {

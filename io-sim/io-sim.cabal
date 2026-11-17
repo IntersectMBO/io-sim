@@ -93,6 +93,7 @@ test-suite test
                        Test.Control.Monad.STM
                        Test.Control.Monad.Utils
                        Test.Control.Monad.IOSim
+                       Test.Control.Monad.IOSim.Preemption
                        Test.Control.Monad.IOSimPOR
   default-language:    GHC2021
   default-extensions:  LambdaCase
