@@ -39,6 +39,7 @@ conjoinSpeculate spec ps =
      return (MkProp $ conj id (spec roses))
  where
 
+  conj :: (Result -> Result) -> [Rose Result] -> Rose Result
   conj k [] =
     MkRose (k succeeded) []
 
@@ -48,15 +49,15 @@ conjoinSpeculate spec ps =
       _ | not (expect result) ->
         return failed { reason = "expectFailure may not occur inside a conjunction" }
       Just True -> conj (addLabels result . addCallbacksAndCoverage result . k) ps
-      Just False -> p
+      Just False -> return result
       Nothing -> do
         let rest = conj (addCallbacksAndCoverage result . k) ps
         result2 <- rest
         -- Nasty work to make sure we use the right callbacks
         case ok result2 of
           Just True  -> MkRose (result2 { ok = Nothing }) []
-          Just False -> rest
-          Nothing    -> rest
+          Just False -> return result2
+          Nothing    -> return result2
 
   addCallbacksAndCoverage result r =
     r { callbacks = callbacks result ++ callbacks r,
