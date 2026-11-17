@@ -13,6 +13,16 @@ module Control.Monad.IOSim
   , Failure (..)
   , runSimTrace
   , runSimTraceST
+    -- *** Preemption
+    -- $preemption
+  , Preemption (..)
+  , noPreemption
+  , preemptRandom
+  , preemptFromMap
+  , preemptionsOf
+  , runSimWith
+  , runSimTraceWith
+  , runSimTraceSTWith
     -- *** QuickCheck Monadic combinators
   , monadicIOSim_
   , monadicIOSim
@@ -97,6 +107,8 @@ import Prelude
 import Data.Bifoldable
 import Data.Dynamic (fromDynamic)
 import Data.List (intercalate)
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Typeable (Typeable)
@@ -109,7 +121,9 @@ import Control.Monad.ST.Lazy
 
 import Control.Monad.Class.MonadThrow as MonadThrow
 
-import Control.Monad.IOSim.Internal (runSimTraceST)
+import Control.Monad.Class.MonadTime.SI (DiffTime)
+import Control.Monad.IOSim.Internal (Preemption (..), noPreemption,
+           preemptRandom, runSimTraceST, runSimTraceSTWith)
 import Control.Monad.IOSim.Types
 import Control.Monad.IOSimPOR.Internal qualified as IOSimPOR (controlSimTraceST)
 import Control.Monad.IOSimPOR.QuickCheckUtils
@@ -501,6 +515,49 @@ ppSayTrace tr = ppEvents
 --
 runSimTrace :: forall a. (forall s. IOSim s a) -> SimTrace a
 runSimTrace mainAction = runST (runSimTraceST mainAction)
+
+--
+-- Preemption
+--
+
+-- $preemption
+--
+-- /IOSim/ advances time only when no thread can run, so a window between two
+-- steps of one thread is never open while time passes.  Real threads are
+-- descheduled at any point.  A 'Preemption' oracle restores some of that: at
+-- a thread's yield points (after a committed STM transaction, `yield`, or
+-- `timeout`'s setup) it may deschedule the thread for a while.  Other threads
+-- run and time advances; the preempted thread then carries on.  Without an
+-- oracle ('runSimTrace') nothing changes.
+--
+-- Search with 'preemptRandom', take the preemptions of a failing run with
+-- 'preemptionsOf', and shrink them as a 'Map' replayed by 'preemptFromMap'.
+
+-- | Preempt exactly the given (thread, yield count) points.
+--
+preemptFromMap :: Map (IOSimThreadId, Int) DiffTime -> Preemption
+preemptFromMap m = Preemption $ \tid n -> Map.lookup (tid, n) m
+
+-- | The preemptions a run made, for 'preemptFromMap'.
+--
+preemptionsOf :: SimTrace a -> Map (IOSimThreadId, Int) DiffTime
+preemptionsOf = Map.fromList . go
+  where
+    go (SimTrace _ tid _ (EventPreempted _ n d _) t) = ((tid, n), d) : go t
+    go (Cons _ t)                                    = go t
+    go (Nil _)                                       = []
+
+-- | 'runSimTrace' with a preemption oracle.
+--
+runSimTraceWith :: forall a. Preemption -> (forall s. IOSim s a) -> SimTrace a
+runSimTraceWith preemption mainAction =
+    runST (runSimTraceSTWith preemption mainAction)
+
+-- | 'runSim' with a preemption oracle.
+--
+runSimWith :: forall a. Preemption -> (forall s. IOSim s a) -> Either Failure a
+runSimWith preemption mainAction =
+    traceResult False (runSimTraceWith preemption mainAction)
 
 --
 -- IOSimPOR

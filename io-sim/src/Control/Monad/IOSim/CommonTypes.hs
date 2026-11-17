@@ -183,6 +183,9 @@ data ThreadStatus = ThreadRunning
 data BlockedReason = BlockedOnSTM
                    | BlockedOnDelay
                    | BlockedOnThrowTo
+                   | BlockedOnPreempt
+                   -- ^ descheduled by the preemption oracle while runnable;
+                   -- not an interruptible operation
   deriving (Eq, Show)
 
 -- | A labelled value.
