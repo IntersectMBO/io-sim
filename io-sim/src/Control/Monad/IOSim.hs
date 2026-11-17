@@ -562,8 +562,8 @@ exploreSimTrace optsf mainAction k =
                               $ controlSimTrace
                                   (explorationStepTimelimit opts) control mainAction
           (sleeper,trace) = compareTraces passingTrace trace0
-      in ( counterexample ("Schedule control: " ++ show control)
-         $ counterexample
+      in   counterexample ("Schedule control: " ++ show control)
+         ( counterexample
             (case sleeper of
               Nothing -> "No thread delayed"
               Just ((t,tid,lab),racing) ->
