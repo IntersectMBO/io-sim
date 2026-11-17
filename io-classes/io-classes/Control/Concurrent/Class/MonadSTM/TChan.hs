@@ -21,6 +21,9 @@ module Control.Concurrent.Class.MonadSTM.TChan
   , writeTChan
   , unGetTChan
   , isEmptyTChan
+    -- * MonadLabelledSTM
+  , labelTChan
+  , labelTChanIO
   ) where
 
 import Control.Monad.Class.MonadSTM.Internal

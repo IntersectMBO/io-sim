@@ -17,6 +17,9 @@ module Control.Concurrent.Class.MonadSTM.Strict.TChan
   , unGetTChan
   , isEmptyTChan
   , cloneTChan
+    -- * MonadLabelSTM
+  , labelTChan
+  , labelTChanIO
   ) where
 
 
@@ -67,3 +70,9 @@ isEmptyTChan = Lazy.isEmptyTChan . toLazyTChan
 
 cloneTChan :: MonadSTM m => StrictTChan m a -> STM m (StrictTChan m a)
 cloneTChan = fmap fromLazyTChan . Lazy.cloneTChan . toLazyTChan
+
+labelTChan :: MonadLabelledSTM m => StrictTChan m a -> String -> STM m ()
+labelTChan (StrictTChan chan) = Lazy.labelTChan chan
+
+labelTChanIO :: MonadLabelledSTM m => StrictTChan m a -> String -> m ()
+labelTChanIO v = atomically . labelTChan v
