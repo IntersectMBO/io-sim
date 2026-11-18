@@ -1,5 +1,12 @@
 # Revision history of io-sim
 
+## Next version
+
+### Patch
+
+* `traceEvents` no longer stops at the first `TraceRacesFound`, which traces
+  from `controlSimTrace` contain, so it returns every event of such a trace.
+
 ## 1.11.0.0
 
 ### Breaking changes

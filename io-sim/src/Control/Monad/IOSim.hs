@@ -459,6 +459,7 @@ traceEvents (SimTrace time tid tlbl event t)      = (time, tid, tlbl, event)
                                                   : traceEvents t
 traceEvents (SimPORTrace time tid _ tlbl event t) = (time, tid, tlbl, event)
                                                   : traceEvents t
+traceEvents (TraceRacesFound _ t)                 = traceEvents t
 traceEvents _                                     = []
 
 
