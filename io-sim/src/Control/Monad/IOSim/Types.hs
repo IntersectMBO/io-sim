@@ -14,6 +14,7 @@ module Control.Monad.IOSim.Types
   ( IOSim (..)
   , runIOSim
   , traceM
+  , exploreRacesOfThreadsLabelled
   , traceSTM
   , liftST
   , SimA (..)
@@ -148,6 +149,16 @@ runIOSim (IOSim k) = k Return
 traceM :: Typeable a => a -> IOSim s ()
 traceM !x = IOSim $ oneShot $ \k -> Output (toDyn x) (k ())
 
+-- | /IOSimPOR/: from now on, take into account, when discovering races, each
+-- thread whose label satisfies the predicate: a thread already so labelled,
+-- and a thread once it is given such a label, until it is given one that does
+-- not. A thread such a thread forks races too, until it is labelled: then its
+-- own label decides. Unlike with 'exploreRaces', so, a labelled child does not
+-- inherit it. A later call replaces the predicate. Calling it once a test has set up what it wants to explore keeps
+-- the races of the set-up out of the exploration. 'runSimTrace' ignores it.
+exploreRacesOfThreadsLabelled :: (ThreadLabel -> Bool) -> IOSim s ()
+exploreRacesOfThreadsLabelled p = IOSim $ oneShot $ \k -> ExploreRacesOfThreadsLabelled p (k ())
+
 -- | Trace a value, in the same was as `traceM` does, but from the `STM` monad.
 -- This is primarily useful for debugging.
 --
@@ -196,6 +207,8 @@ data SimA s a where
   YieldSim     :: SimA s a -> SimA s a
 
   ExploreRaces :: SimA s b -> SimA s b
+
+  ExploreRacesOfThreadsLabelled :: (ThreadLabel -> Bool) -> SimA s b -> SimA s b
 
   Fix          :: (x -> IOSim s x) -> (x -> SimA s r) -> SimA s r
   NewUnique    :: (Sim.Unique s -> SimA s r) -> SimA s r
