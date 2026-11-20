@@ -76,7 +76,7 @@ library
                        psqueues          >=0.2 && <0.3,
                        time              >=1.9.1 && <1.16,
                        quiet,
-                       QuickCheck,
+                       QuickCheck        >=2.15,
                        parallel
 
 

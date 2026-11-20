@@ -12,10 +12,13 @@ import Data.Foldable (traverse_)
 #else
 import Data.Foldable (foldl', traverse_)
 #endif
+import Data.Either (isLeft)
 import Data.Functor (($>))
 import Data.List qualified as List
 import Data.Map (Map)
 import Data.Map qualified as Map
+import Data.Set (Set)
+import Data.Set qualified as Set
 
 import System.Exit
 import System.IO.Error (ioeGetErrorString, isUserError)
@@ -66,6 +69,12 @@ tests =
       , testProperty "racy"           unit_issue113_racy
       , testProperty "nonDep"         unit_issue113_nonDep
       ]
+    , testGroup "throwTo races with a wake-up"
+      [ testProperty "thrower runs first"
+          (unit_throwTo_races_with_wakeup False)
+      , testProperty "writer runs first"
+          (unit_throwTo_races_with_wakeup True)
+      ]
     -- , testProperty "propPermutations" propPermutations
     ]
   , testGroup "IO simulator properties"
@@ -77,6 +86,16 @@ tests =
       , testProperty "timeouts"               prop_timeouts
       , testProperty "stacked timeouts"       prop_stacked_timeouts
       , testProperty "{register,thread}Delay" unit_registerDelay_threadDelay
+        -- When unmasked, the exception of the assassin is raised as soon as
+        -- it is thrown, so the paths these tests are for are never reached.
+      , testProperty "assassin: pending throw"
+      $ forall_masked_states unit_timeout_assassin_pending_throw
+      , testProperty "assassin: holds the lock"
+      $ forall_masked_states unit_timeout_assassin_holds_lock
+      , testProperty "assassin: frame unwound"
+      $ forall_masked_states unit_timeout_assassin_frame_unwound
+      , testProperty "forwarded timeout exception"
+                                              unit_timeout_forwarded_exception
       ]
     , testProperty "infinite simulation"      prop_explore_endless_simulation
     , testProperty "threadId order (IOSim)"   (withNumTests 1000 prop_threadId_order_order_Sim)
@@ -135,6 +154,28 @@ tests =
       , testProperty "7"  unit_async_7
       , testProperty "8"  unit_async_8
       , testProperty "9"  unit_async_9
+      ]
+    , testGroup "pending async exceptions: throwTo"
+      [ testProperty "not overwritten by throwTo"
+          unit_throwTo_does_not_overwrite_pending_exception_ST
+      ]
+    , testGroup "pending async exceptions"
+      [ testProperty "raised when timeout returns, at blocking op"
+          unit_timeout_raises_pending_exception_at_blocking_op_ST
+      , testProperty "stacked timeouts: inner assassin not leaked"
+          unit_timeout_stacked_pending_exception_ST
+      , testProperty "forwarded timeout exception, rethrown"
+          unit_timeout_forwarded_exception_rethrown_ST
+      , testProperty "raised when timeout returns, on unmask"
+          unit_timeout_raises_pending_exception_on_unmask_ST
+      ]
+    , testGroup "throwTo cancellation"
+      [ testProperty "interrupted by a pending exception"
+          unit_throwTo_interrupted_by_pending_exception_ST
+      , testProperty "thrower killed"
+          unit_throwTo_thrower_killed_ST
+      , testProperty "thrower not woken"
+          unit_throwTo_cancelled_thrower_not_woken_ST
       ]
     , testGroup "STM reference semantics"
       [ testProperty "Reference vs Sim"   prop_stm_referenceSim
@@ -415,6 +456,67 @@ unit_issue113_nonDep =
                    Task [ThrowTo 1,WhenSet 1 1],
                    Task [ThrowTo 5],
                    Task [ThrowTo 1]]
+
+
+-- | A `throwTo` to a masked thread, which is blocked in STM, races with a write
+-- which wakes the thread up:
+--
+-- * if the exception is thrown first, the thread is blocked, hence
+--   interruptible, so the exception is raised at once and the transaction
+--   doesn't commit;
+-- * if the write is first, the thread is runnable, so the exception is pending
+--   until the thread unmasks, after the transaction committed.
+--
+-- IOSimPOR must explore both orders, whichever of them runs first.
+--
+unit_throwTo_races_with_wakeup :: Bool -- ^ whether the writer runs first
+                               -> Property
+unit_throwTo_races_with_wakeup writerFirst =
+    once $ exploreSimResults experiment $ \results ->
+      counterexample ("explored results: " ++ show (Set.toList results)) $
+      results === Set.fromList [False, True]
+  where
+    -- returns whether the blocked transaction committed
+    experiment :: IOSim s Bool
+    experiment = do
+      exploreRaces
+      flag      <- newTVarIO False
+      committed <- newTVarIO False
+      t <- async $ mask_ $ atomically $ do
+             readTVar flag >>= check
+             writeTVar committed True
+      let writer  = threadDelay 1 >> atomically (writeTVar flag True)
+          thrower = threadDelay 1 >> throwTo (asyncThreadId t) DivideByZero
+      -- at time 1, the thread forked last runs first, since it has the larger
+      -- thread id
+      ws <- if writerFirst
+              then do a <- async thrower
+                      w <- async writer
+                      return [a, w]
+              else do w <- async writer
+                      a <- async thrower
+                      return [w, a]
+      _ <- waitCatch t
+      traverse_ wait ws
+      readTVarIO committed
+
+
+-- | Explore the schedules of a simulation, and check the set of results of all
+-- the explored schedules.
+--
+exploreSimResults :: Ord a
+                  => (forall s. IOSim s a)
+                  -> (Set a -> Property)
+                  -> Property
+exploreSimResults sim k = ioProperty $ do
+    r <- newIORef Set.empty
+    return $
+           exploreSimTrace id sim
+             (\_ trace -> case traceResult False trace of
+                 Right a -> ioProperty (modifyIORef' r (Set.insert a) $> True)
+                 Left e  -> counterexample (show e) False)
+      -- `.&&.` checks all the explored schedules before the results
+      .&&. ioProperty (k <$> readIORef r)
 
 
 -- Testing propPermutations n should collect every permutation of [1..n] once only.
@@ -1023,6 +1125,8 @@ prop_timeouts times = exploreSimTrace id experiment $ \_ trace ->
                ("too many failures: " ++ show numFailures ++ " ≰ " ++ show maxFailures)
                (numFailures <= maxFailures)
 
+data TimeoutResult = OuterTimeout | InnerTimeout | Result
+  deriving (Eq, Ord, Show)
 
 prop_stacked_timeouts :: DiffTime
                       -> DiffTime
@@ -1031,29 +1135,68 @@ prop_stacked_timeouts :: DiffTime
 prop_stacked_timeouts timeout0 timeout1 actionDuration =
     exploreSimTrace id experiment $ \_ trace ->
       case traceResult False trace of
-        Right result -> result === predicted
+        Right result -> counterexample ("predicted: " ++ show predicted)
+                      $ result === expected
+                   .&&. counterexample "the expected result is not predicted"
+                                       (expected `elem` predicted)
         Left e       -> counterexample (show e) False
   where
-    experiment :: IOSim s (Maybe (Maybe ()))
+    experiment :: IOSim s TimeoutResult
     experiment = exploreRaces
-              >> timeout timeout0 (timeout timeout1 (threadDelay actionDuration))
+              >> fn <$> timeout timeout0 (timeout timeout1 (threadDelay actionDuration))
+      where
+        fn Nothing         = OuterTimeout
+        fn (Just Nothing)  = InnerTimeout
+        fn (Just (Just _)) = Result
 
+    predicted :: [TimeoutResult]
     predicted | timeout0 == 0
-              = Nothing
+              = [OuterTimeout]
 
               | timeout1 == 0
-              = Just Nothing
+              = [InnerTimeout]
 
-              -- This differs from `IOSim` case; `IOSimPOR` is using
-              -- different scheduler.
               | actionDuration < min timeout0 timeout1
-              = Just (Just ())
+              = [Result]
+
+              -- The action finishes when a timeout fires, either of them can
+              -- win.  This differs from `IOSim` case; `IOSimPOR` is using
+              -- different scheduler.
+              | actionDuration == min timeout0 timeout1
+              = Result : [ OuterTimeout | timeout0 == actionDuration ]
+                      ++ [ InnerTimeout | timeout1 == actionDuration ]
 
               | timeout0 < timeout1
-              = Nothing
+              = [OuterTimeout]
 
-              | otherwise -- i.e. timeout0 >= timeout1
-              = Just Nothing
+              -- both timeouts fire at the same time, either of them can win
+              | timeout0 == timeout1
+              = [OuterTimeout, InnerTimeout]
+
+              | otherwise -- i.e. timeout0 > timeout1
+              = [InnerTimeout]
+
+    -- The result of the only schedule which `IOSimPOR` explores.  The
+    -- timeouts run in the main thread, whose thread id is not racy, so its
+    -- steps do not start races and a tie is decided by the default schedule:
+    -- the action wins a tie with a timeout, and the outer timeout wins a tie
+    -- with the inner one.  Checking that all the `predicted` results are
+    -- explored needs `IOSimPOR` to explore these races.
+    expected :: TimeoutResult
+    expected | timeout0 == 0
+             = OuterTimeout
+
+             | timeout1 == 0
+             = InnerTimeout
+
+             | actionDuration <= min timeout0 timeout1
+             = Result
+
+             | timeout0 <= timeout1
+             = OuterTimeout
+
+             | otherwise
+             = InnerTimeout
 
 unit_registerDelay_threadDelay :: Property
 unit_registerDelay_threadDelay =
@@ -1149,6 +1292,132 @@ unit_timeouts_and_async_exceptions_3 =
       threadDelay 1
       return $ property True
 
+
+-- | Similar to `ioProperty`, but explores races with `IOSimPOR`.
+-- `exploreRaces` is enabled at the start of the `IOSim s` property.
+--
+ioSimPORProperty
+  :: Testable property
+  => Bool
+  -- ^ if True the property will fail if there are any threads which
+  -- didn't terminate when the main thread terminated.
+  -> (forall s. IOSim s property)
+  -> Property
+ioSimPORProperty strict iosim =
+    exploreSimTrace id (exploreRaces >> iosim) $ \_ trace ->
+        counterexample (ppTrace_ trace)
+      . either (\e -> counterexample (show e) False)
+               property
+      . traceResult strict
+      $ trace
+
+
+-- | The assassin of a `timeout` throws while the timed thread is masked and
+-- runnable, so its exception is pending when the action finishes.  It must
+-- not be raised after `timeout` returns (#269).
+--
+-- `timeout` runs in a forked thread, so that the steps of the timed thread
+-- are racy: the steps of the main thread never start a race.
+--
+unit_timeout_assassin_pending_throw :: MaskingState -> Property
+unit_timeout_assassin_pending_throw ms =
+    ioSimPORProperty False experiment
+  where
+    experiment :: IOSim s Property
+    experiment = do
+      flag <- newTVarIO False
+      w <- async $ threadDelay 1 >> atomically (writeTVar flag True)
+      r <- waitCatch =<< async (setMaskingState_ ms $
+             timeout 1 (atomically (readTVar flag >>= check)))
+      -- The simulation ends when the main thread returns: if it did not wait
+      -- for the writer, the writer would not run in the schedules in which
+      -- the assassin throws first, and their race would not be explored.
+      wait w
+      return $ case r of
+        Left e  -> counterexample (show e) False
+        Right _ -> property True
+
+
+-- | The timed thread catches the `TimeoutException` of its `timeout`, and
+-- another thread throws it back while the timed thread is masked within the
+-- frame.  Leaving the frame must only retract the assassin's exception, not
+-- the forwarded one: otherwise the forwarding thread stays blocked in
+-- `throwTo` forever.
+--
+unit_timeout_forwarded_exception :: Property
+unit_timeout_forwarded_exception =
+    ioSimPORProperty False experiment
+  where
+    experiment :: IOSim s Property
+    experiment = do
+      tid  <- myThreadId
+      done <- newEmptyTMVarIO
+      r <- try $ mask_ $ do
+        _ <- timeout 1 $ do
+          -- `threadDelay` is interruptible, the timeout fires here
+          r' <- try (threadDelay 2)
+          case r' :: Either SomeException () of
+            Left e   -> void $ forkIO $ throwTo tid e
+                                     >> atomically (putTMVar done ())
+            Right () -> return ()
+          -- let the forked thread block in `throwTo`
+          uninterruptibleMask_ (threadDelay 1)
+        -- an interruptible point: the forwarded exception is raised here
+        atomically (takeTMVar done)
+      -- the forwarding thread finished
+      atomically (takeTMVar done)
+      return $ counterexample (show r)
+             $ isLeft (r :: Either SomeException ())
+
+
+-- | The assassin of a `timeout` takes the lock, but the action finishes
+-- before it throws.  The exception must not be raised after `timeout`
+-- returns (#269).
+--
+-- `timeout` runs in a forked thread, so that the steps of the timed thread
+-- are racy: the steps of the main thread never start a race.
+--
+unit_timeout_assassin_holds_lock :: MaskingState -> Property
+unit_timeout_assassin_holds_lock ms =
+    ioSimPORProperty False experiment
+  where
+    experiment :: IOSim s Property
+    experiment = do
+      r <- waitCatch =<< async (setMaskingState_ ms $
+             timeout 1 (threadDelay 1 >> atomically (return ())))
+      return $ case r of
+        Left e  -> counterexample (show e) False
+        Right _ -> property True
+
+
+-- | The action throws at the deadline, and the exception unwinds through the
+-- `TimeoutFrame` and is caught outside of it.  The assassin must not throw
+-- after the frame is left, and its exception must not be pending (#269).
+--
+-- `timeout` runs in a forked thread, so that the steps of the timed thread
+-- are racy: the steps of the main thread never start a race.
+--
+unit_timeout_assassin_frame_unwound :: MaskingState -> Property
+unit_timeout_assassin_frame_unwound ms =
+    ioSimPORProperty False experiment
+  where
+    experiment :: IOSim s Property
+    experiment = do
+      r <- waitCatch =<< async (do
+             r <- try $ setMaskingState_ ms $
+                    timeout 1 ( threadDelay 1
+                             >> atomically (return ())
+                             >> throwIO DivideByZero)
+             -- an interruptible point, a stale exception would be raised here
+             threadDelay 1
+             return (r :: Either ArithException (Maybe ())))
+      return $ case r of
+        Left e                    -> counterexample (show e) False
+        -- the timeout won
+        Right (Right Nothing)     -> property True
+        Right (Left DivideByZero) -> property True
+        Right r'                  -> counterexample (show r') False
+
 --
 -- MonadMask properties
 --
@@ -1208,3 +1477,50 @@ unit_catch_throwTo_masking_state_async_mayblock_ST ms =
     case traceResult False trace of
       Right a -> a
       Left e  -> counterexample (show e) False
+
+unit_timeout_raises_pending_exception_at_blocking_op_ST :: Property
+unit_timeout_raises_pending_exception_at_blocking_op_ST =
+    once $ ioSimPORProperty False
+         $ prop_timeout_raises_pending_exception_at_blocking_op
+
+-- | The simulation also fails if any thread, e.g. the inner assassin, is
+-- still running or blocked when the main thread returns.
+--
+unit_timeout_stacked_pending_exception_ST :: Property
+unit_timeout_stacked_pending_exception_ST =
+    once $ ioSimPORProperty True
+         $ prop_timeout_stacked_pending_exception
+
+unit_throwTo_does_not_overwrite_pending_exception_ST :: Property
+unit_throwTo_does_not_overwrite_pending_exception_ST =
+    once $ ioSimPORProperty False
+         $ prop_throwTo_does_not_overwrite_pending_exception
+
+unit_timeout_forwarded_exception_rethrown_ST :: Property
+unit_timeout_forwarded_exception_rethrown_ST =
+    once $ ioSimPORProperty False
+         $ prop_timeout_forwarded_exception_rethrown
+
+unit_timeout_raises_pending_exception_on_unmask_ST :: Property
+unit_timeout_raises_pending_exception_on_unmask_ST =
+    once $ ioSimPORProperty False
+         $ prop_timeout_raises_pending_exception_on_unmask
+
+unit_throwTo_interrupted_by_pending_exception_ST :: Property
+unit_throwTo_interrupted_by_pending_exception_ST =
+    once $ ioSimPORProperty False
+         $ prop_throwTo_interrupted_by_pending_exception
+
+unit_throwTo_thrower_killed_ST :: Property
+unit_throwTo_thrower_killed_ST =
+    once $ ioSimPORProperty False $ prop_throwTo_thrower_killed
+
+unit_throwTo_cancelled_thrower_not_woken_ST :: Property
+unit_throwTo_cancelled_thrower_not_woken_ST = once $
+    exploreSimTrace id
+      (exploreRaces >> prop_throwTo_cancelled_thrower_not_woken)
+      $ \_ trace ->
+        counterexample (ppTrace_ trace)
+      . either (\e -> counterexample (show e) False) id
+      . traceResult False
+      $ trace
