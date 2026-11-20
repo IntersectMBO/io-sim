@@ -1986,7 +1986,7 @@ racingSteps s s' =
      -- steps which belong to the same thread cannot race
   && stepThreadId s /= stepThreadId s'
      -- if s wakes up s' then s and s' cannot race
-  && not (stepThreadId s' `elem` effectWakeup (stepEffect s))
+  && stepThreadId s' `notElem` effectWakeup (stepEffect s)
      -- s effects races with s' effects or either one throws to the other
   && (  stepEffect s `racingEffects` stepEffect s'
      || throwsTo s s'
