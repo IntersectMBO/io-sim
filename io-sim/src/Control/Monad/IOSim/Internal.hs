@@ -506,7 +506,7 @@ schedule !thread@Thread{
       let thread' = thread { threadControl = ThreadControl k ctl }
       schedule thread' simstate
 
-    Fork a k -> do
+    Fork threadLabel a k -> do
       let !nextId   = threadNextTId thread
           !tid'     = childThreadId False tid nextId
           !thread'  = thread { threadControl = ThreadControl (k tid') ctl
@@ -518,7 +518,7 @@ schedule !thread@Thread{
                              , threadMasking = threadMasking thread
                              , threadThrowTo = []
                              , threadClockId = threadClockId thread
-                             , threadLabel   = Nothing
+                             , threadLabel
                              , threadNextTId = 1
                              }
           !threads' = Map.insert tid' thread'' threads

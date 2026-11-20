@@ -52,9 +52,15 @@ import Quiet
 -- | A thread id.
 --
 -- /IOSimPOR/: 'RacyThreadId' indicates that this thread is taken into account
--- when discovering races.  A thread is marked as racy iff
--- `Control.Monad.Class.MonadTest.exploreRaces` was
--- executed in it or it's a thread forked by a racy thread.
+-- when discovering races.  A thread is marked as racy iff one of the following
+-- conditions is satisfied:
+--
+-- * `Control.Monad.Class.MonadTest.exploreRaces` was
+-- executed in it; or
+-- * it's a thread forked by a racy thread; or
+-- * it is forked with one of `forkLabelledIO`, `asyncLabelled`,
+--   `withAsyncLabelled` or similar, and `explorationRacyByLabel` callback match
+--   the thread label.
 --
 data IOSimThreadId =
     -- | A racy thread (`IOSimPOR` only), shown in the trace with curly braces,

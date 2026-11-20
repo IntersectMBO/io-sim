@@ -56,7 +56,9 @@ class ( MonadSTM m
       ) => MonadAsync m where
 
   {-# MINIMAL async, asyncBound, asyncOn, asyncThreadId, cancel, cancelWith,
-              asyncWithUnmask, asyncOnWithUnmask, waitCatchSTM, pollSTM #-}
+              asyncWithUnmask, asyncOnWithUnmask, waitCatchSTM, pollSTM,
+              asyncLabelled, asyncLabelledBound, asyncLabelledOn,
+              asyncLabelledWithUnmask, asyncLabelledOnWithUnmask #-}
 
   -- | An asynchronous action
   --
@@ -200,6 +202,19 @@ class ( MonadSTM m
   -- | See 'Async.compareAsyncs'.
   compareAsyncs         :: Async m a -> Async m b -> Ordering
 
+  -- non-standard APIs
+
+  asyncLabelled                 :: String -> m a -> m (Async m a)
+  asyncLabelledBound            :: String -> m a -> m (Async m a)
+  asyncLabelledOn               :: String -> Int -> m a -> m (Async m a)
+  withAsyncLabelled             :: String -> m a -> (Async m a -> m b) -> m b
+  withAsyncLabelledBound        :: String -> m a -> (Async m a -> m b) -> m b
+  withAsyncLabelledOn           :: String -> Int -> m a -> (Async m a -> m b) -> m b
+  asyncLabelledWithUnmask       :: String -> ((forall b . m b -> m b) ->  m a) -> m (Async m a)
+  asyncLabelledOnWithUnmask     :: String -> Int -> ((forall b . m b -> m b) ->  m a) -> m (Async m a)
+  withAsyncLabelledWithUnmask   :: String -> ((forall c. m c -> m c) ->  m a) -> (Async m a -> m b) -> m b
+  withAsyncLabelledOnWithUnmask :: String -> Int -> ((forall c. m c -> m c) ->  m a) -> (Async m a -> m b) -> m b
+
   -- default implementations
   default withAsync     :: MonadMask m => m a -> (Async m a -> m b) -> m b
   default withAsyncBound:: MonadMask m => m a -> (Async m a -> m b) -> m b
@@ -224,31 +239,22 @@ class ( MonadSTM m
   default compareAsyncs         :: Ord (ThreadId m)
                                 => Async m a -> Async m b -> Ordering
 
-  withAsync action inner = mask $ \restore -> do
-                             a <- async (restore action)
-                             restore (inner a)
-                               `finally` uninterruptibleCancel a
+  withAsync action =
+    withAsyncUsing (\restore -> async (restore action))
 
-  withAsyncBound action inner = mask $ \restore -> do
-                                  a <- asyncBound (restore action)
-                                  restore (inner a)
-                                    `finally` uninterruptibleCancel a
+  withAsyncBound action =
+    withAsyncUsing (\restore -> asyncBound (restore action))
 
-  withAsyncOn n action inner = mask $ \restore -> do
-                                 a <- asyncOn n (restore action)
-                                 restore (inner a)
-                                   `finally` uninterruptibleCancel a
+  withAsyncOn n action =
+    withAsyncUsing (\restore -> asyncOn n (restore action))
 
+  -- the child runs in the masking state of the parent, as in the `async`
+  -- package; `asyncWithUnmask` forks it masked, since we are inside `mask`.
+  withAsyncWithUnmask action =
+    withAsyncUsing (\restore -> asyncWithUnmask (\unmask -> restore (action unmask)))
 
-  withAsyncWithUnmask action inner = mask $ \restore -> do
-                                       a <- asyncWithUnmask action
-                                       restore (inner a)
-                                         `finally` uninterruptibleCancel a
-
-  withAsyncOnWithUnmask n action inner = mask $ \restore -> do
-                                           a <- asyncOnWithUnmask n action
-                                           restore (inner a)
-                                             `finally` uninterruptibleCancel a
+  withAsyncOnWithUnmask n action =
+    withAsyncUsing (\restore -> asyncOnWithUnmask n (\unmask -> restore (action unmask)))
 
   wait      = atomically . waitSTM
   poll      = atomically . pollSTM
@@ -290,6 +296,50 @@ class ( MonadSTM m
   concurrently_   left right = void $ concurrently left right
 
   compareAsyncs a b = asyncThreadId a `compare` asyncThreadId b
+
+  default withAsyncLabelled     :: MonadMask m => String -> m a -> (Async m a -> m b) -> m b
+  default withAsyncLabelledBound:: MonadMask m => String -> m a -> (Async m a -> m b) -> m b
+  default withAsyncLabelledOn   :: MonadMask m => String -> Int -> m a -> (Async m a -> m b) -> m b
+  default withAsyncLabelledWithUnmask
+                        :: MonadMask m => String
+                                       -> ((forall c. m c -> m c) ->  m a)
+                                       -> (Async m a -> m b) -> m b
+  default withAsyncLabelledOnWithUnmask
+                        :: MonadMask m => String
+                                       -> Int
+                                       -> ((forall c. m c -> m c) ->  m a)
+                                       -> (Async m a -> m b) -> m b
+
+  withAsyncLabelled lbl action =
+    withAsyncUsing (\restore -> asyncLabelled lbl (restore action))
+
+  withAsyncLabelledBound lbl action =
+    withAsyncUsing (\restore -> asyncLabelledBound lbl (restore action))
+
+  withAsyncLabelledOn lbl n action =
+    withAsyncUsing (\restore -> asyncLabelledOn lbl n (restore action))
+
+  withAsyncLabelledWithUnmask lbl action =
+    withAsyncUsing (\restore -> asyncLabelledWithUnmask lbl (\unmask -> restore (action unmask)))
+
+  withAsyncLabelledOnWithUnmask lbl n action =
+    withAsyncUsing (\restore -> asyncLabelledOnWithUnmask lbl n (\unmask -> restore (action unmask)))
+
+-- | The bracket shared by the default `withAsync` family implementations.
+--
+-- The first argument spawns the child thread; it runs inside `mask` and
+-- receives its `restore`, which it must use to restore the parent's masking
+-- state in the child.  The inner action runs with the parent's masking state,
+-- and the child is cancelled when it returns or throws.
+--
+withAsyncUsing :: (MonadAsync m, MonadMask m)
+               => ((forall x. m x -> m x) -> m (Async m a))
+               -> (Async m a -> m b)
+               -> m b
+withAsyncUsing spawn inner = mask $ \restore -> do
+    a <- spawn restore
+    restore (inner a)
+      `finally` uninterruptibleCancel a
 
 -- | Similar to 'Async.Concurrently' but which works for any 'MonadAsync'
 -- instance.
@@ -408,6 +458,26 @@ instance MonadAsync IO where
 
   compareAsyncs         = Async.compareAsyncs
 
+  asyncLabelled lbl      = Async.async      . (labelThisThread lbl >>)
+  asyncLabelledBound lbl = Async.asyncBound . (labelThisThread lbl >>)
+  asyncLabelledOn lbl n  = Async.asyncOn n  . (labelThisThread lbl >>)
+  asyncLabelledWithUnmask lbl k
+                         = Async.asyncWithUnmask
+                             (\unmask -> labelThisThread lbl >> k unmask)
+  asyncLabelledOnWithUnmask lbl n k
+                         = Async.asyncOnWithUnmask n
+                             (\unmask -> labelThisThread lbl >> k unmask)
+
+  withAsyncLabelled lbl      = Async.withAsync      . (labelThisThread lbl >>)
+  withAsyncLabelledBound lbl = Async.withAsyncBound . (labelThisThread lbl >>)
+  withAsyncLabelledOn lbl n  = Async.withAsyncOn n  . (labelThisThread lbl >>)
+  withAsyncLabelledWithUnmask lbl k
+                             = Async.withAsyncWithUnmask
+                                 (\unmask -> labelThisThread lbl >> k unmask)
+  withAsyncLabelledOnWithUnmask lbl n k
+                             = Async.withAsyncOnWithUnmask n
+                                 (\unmask -> labelThisThread lbl >> k unmask)
+
 
 --
 -- Linking
@@ -504,7 +574,7 @@ forkRepeat label action =
                 case r of
                   Left _ -> go
                   _      -> return ()
-    in forkIO (labelThisThread label >> go)
+    in forkLabelledIO label go
 
 tryAll :: MonadCatch m => m a -> m (Either SomeException a)
 tryAll = try
@@ -598,6 +668,49 @@ instance ( MonadAsync m
     waitEitherCatchCancel = on (lift .: waitEitherCatchCancel) getAsyncReaderT
     waitEither_           = on (lift .: waitEither_)           getAsyncReaderT
     waitBoth              = on (lift .: waitBoth)              getAsyncReaderT
+
+    asyncLabelled      lbl   (ReaderT ma) = ReaderT $ \r -> AsyncReaderT <$> asyncLabelled lbl (ma r)
+    asyncLabelledBound lbl   (ReaderT ma) = ReaderT $ \r -> AsyncReaderT <$> asyncLabelledBound lbl (ma r)
+    asyncLabelledOn    lbl n (ReaderT ma) = ReaderT $ \r -> AsyncReaderT <$> asyncLabelledOn lbl n (ma r)
+
+    asyncLabelledWithUnmask lbl f = ReaderT $ \r -> fmap AsyncReaderT
+                                                  $ asyncLabelledWithUnmask lbl
+                                                  $ \unmask -> runReaderT (f (liftF unmask)) r
+      where
+        liftF :: (m a -> m a) -> ReaderT r m a -> ReaderT r m a
+        liftF g (ReaderT r) = ReaderT (g . r)
+
+    asyncLabelledOnWithUnmask lbl n f = ReaderT $ \r -> fmap AsyncReaderT
+                                                      $ asyncLabelledOnWithUnmask lbl n
+                                                      $ \unmask -> runReaderT (f (liftF unmask)) r
+      where
+        liftF :: (m a -> m a) -> ReaderT r m a -> ReaderT r m a
+        liftF g (ReaderT r) = ReaderT (g . r)
+
+    withAsyncLabelled lbl (ReaderT ma) f  = ReaderT $ \r -> withAsyncLabelled lbl (ma r)
+                                                    $ \a -> runReaderT (f (AsyncReaderT a)) r
+    withAsyncLabelledBound lbl (ReaderT ma) f
+                                          = ReaderT $ \r -> withAsyncLabelledBound lbl (ma r)
+                                                    $ \a -> runReaderT (f (AsyncReaderT a)) r
+    withAsyncLabelledOn lbl n (ReaderT ma) f
+                                          = ReaderT $ \r -> withAsyncLabelledOn lbl n (ma r)
+                                                    $ \a -> runReaderT (f (AsyncReaderT a)) r
+
+    withAsyncLabelledWithUnmask lbl action f =
+      ReaderT $ \r -> withAsyncLabelledWithUnmask lbl (\unmask -> case action (liftF unmask) of
+                                                                    ReaderT ma -> ma r)
+              $ \a -> runReaderT (f (AsyncReaderT a)) r
+      where
+        liftF :: (m a -> m a) -> ReaderT r m a -> ReaderT r m a
+        liftF g (ReaderT r) = ReaderT (g . r)
+
+    withAsyncLabelledOnWithUnmask lbl n action f =
+      ReaderT $ \r -> withAsyncLabelledOnWithUnmask lbl n (\unmask -> case action (liftF unmask) of
+                                                                        ReaderT ma -> ma r)
+              $ \a -> runReaderT (f (AsyncReaderT a)) r
+      where
+        liftF :: (m a -> m a) -> ReaderT r m a -> ReaderT r m a
+        liftF g (ReaderT r) = ReaderT (g . r)
 
 
 --

@@ -27,9 +27,11 @@ import Data.Foldable (foldl')
 import Data.Functor (($>))
 import Data.Time.Clock (picosecondsToDiffTime)
 
+import Control.Concurrent (rtsSupportsBoundThreads)
 import Control.Exception (ArithException (..), AsyncException)
 import Control.Monad
 import Control.Monad.Fix
+import Control.Monad.Trans.Reader (runReaderT)
 import System.IO.Error (ioeGetErrorString, isUserError)
 
 import Control.Concurrent.Class.MonadSTM.Strict
@@ -127,6 +129,11 @@ tests =
     $ forall_masking_states $ \ms  ->
       forall_masking_states $ \ms' -> unit_fork_unmask_ST ms ms'
 
+    , testProperty "withAsyncWithUnmask (IO)"
+    $ forall_masking_states unit_withAsyncWithUnmask_masking_state_IO
+    , testProperty "withAsyncWithUnmask (IOSim)"
+    $ forall_masking_states unit_withAsyncWithUnmask_masking_state_ST
+
     , testProperty "catch (IO)"
     $ forall_masking_states unit_catch_throwIO_masking_state_IO
     , testProperty "catch (IOSim)"
@@ -165,6 +172,12 @@ tests =
   , testGroup "forkIO unit tests"
     [ testProperty "1" unit_fork_1
     , testProperty "2" unit_fork_2
+    ]
+  , testGroup "labelled threads"
+    [ testProperty "IO"            unit_labelled_fork_IO
+    , testProperty "IOSim"         unit_labelled_fork_ST
+    , testProperty "ReaderT IO"    unit_labelled_fork_ReaderT_IO
+    , testProperty "ReaderT IOSim" unit_labelled_fork_ReaderT_ST
     ]
   , testGroup "async exception unit tests"
     [ testProperty "1"  unit_async_1
@@ -1574,6 +1587,14 @@ unit_fork_unmask_IO ms ms' = once $ ioProperty $ prop_fork_unmask ms ms'
 unit_fork_unmask_ST :: MaskingState -> MaskingState -> Property
 unit_fork_unmask_ST ms ms' = once $ runSimOrThrow $ prop_fork_unmask ms ms'
 
+unit_withAsyncWithUnmask_masking_state_IO :: MaskingState -> Property
+unit_withAsyncWithUnmask_masking_state_IO = once .
+    ioProperty . prop_withAsyncWithUnmask_masking_state
+
+unit_withAsyncWithUnmask_masking_state_ST :: MaskingState -> Property
+unit_withAsyncWithUnmask_masking_state_ST ms = once $
+    runSimOrThrow (prop_withAsyncWithUnmask_masking_state ms)
+
 unit_catch_throwIO_masking_state_IO :: MaskingState -> Property
 unit_catch_throwIO_masking_state_IO ms = once $
     ioProperty $ prop_catch_throwIO_masking_state ms
@@ -1621,6 +1642,36 @@ unit_catch_throwTo_masking_state_async_mayblock_IO = once .
 unit_catch_throwTo_masking_state_async_mayblock_ST :: MaskingState -> Property
 unit_catch_throwTo_masking_state_async_mayblock_ST ms = once $
     runSimOrThrow (prop_catch_throwTo_masking_state_async_mayblock ms)
+
+--
+-- Labelled threads
+--
+
+-- | Labelled `fork` and `async` functions which can run in `IO`: forking
+-- a bound thread requires the threaded RTS.
+--
+labelledForksIO :: [LabelledFork]
+labelledForksIO =
+    [ fork
+    | fork <- [minBound .. maxBound]
+    , rtsSupportsBoundThreads || not (isBoundLabelledFork fork)
+    ]
+
+unit_labelled_fork_IO :: Property
+unit_labelled_fork_IO = once $ ioProperty $
+    conjoin <$> traverse prop_labelled_fork labelledForksIO
+
+unit_labelled_fork_ST :: Property
+unit_labelled_fork_ST = once $ runSimOrThrow $
+    conjoin <$> traverse prop_labelled_fork [minBound .. maxBound]
+
+unit_labelled_fork_ReaderT_IO :: Property
+unit_labelled_fork_ReaderT_IO = once $ ioProperty $ flip runReaderT () $
+    conjoin <$> traverse prop_labelled_fork labelledForksIO
+
+unit_labelled_fork_ReaderT_ST :: Property
+unit_labelled_fork_ReaderT_ST = once $ runSimOrThrow $ flip runReaderT () $
+    conjoin <$> traverse prop_labelled_fork [minBound .. maxBound]
 
 --
 -- MonadTimerCancellable

@@ -12,6 +12,7 @@ import Control.Exception (AsyncException, ErrorCall (..))
 import Control.Monad
 
 import Control.Concurrent.Class.MonadSTM.Strict
+import Control.Monad.Class.MonadAsync
 import Control.Monad.Class.MonadFork
 import Control.Monad.Class.MonadThrow
 import Control.Monad.Class.MonadTime.SI
@@ -399,6 +400,36 @@ prop_fork_unmask ms ms' =
         ms'' <- atomically $ takeTMVar var
         return $ Unmasked === ms''
 
+-- | Check that a thread forked by one of the `withAsync*WithUnmask` functions
+-- starts with the masking state of its parent, as in the @async@ package, and
+-- that its 'unmask' function restores 'Unmasked' state.
+--
+prop_withAsyncWithUnmask_masking_state :: forall m.
+                                          ( MonadAsync m
+                                          , MonadMask  m
+                                          )
+                                       => MaskingState -> m Property
+prop_withAsyncWithUnmask_masking_state ms =
+    setMaskingState_ ms $ do
+      rs <- sequence
+        [ ("withAsyncWithUnmask",)
+            <$> withAsyncWithUnmask child wait
+        , ("withAsyncOnWithUnmask",)
+            <$> withAsyncOnWithUnmask 0 child wait
+        , ("withAsyncLabelledWithUnmask",)
+            <$> withAsyncLabelledWithUnmask "label" child wait
+        , ("withAsyncLabelledOnWithUnmask",)
+            <$> withAsyncLabelledOnWithUnmask "label" 0 child wait
+        ]
+      return $ conjoin
+        [ counterexample name $ r === (ms, Unmasked)
+        | (name, r) <- rs
+        ]
+  where
+    -- the masking state in which the child starts, and the one set by 'unmask'
+    child :: (forall x. m x -> m x) -> m (MaskingState, MaskingState)
+    child unmask = (,) <$> getMaskingState <*> unmask getMaskingState
+
 -- | A unit test which checks the masking state in the context of a catch
 -- handler.
 --
@@ -523,6 +554,104 @@ prop_catch_throwTo_masking_state_async_mayblock ms = do
     -- `throwTo` will not be blocked.
     throwTo tid (userError "error")
     atomically $ takeTMVar var
+
+--
+-- Labelled threads
+--
+
+-- | The `forkLabelled` and `asyncLabelled` families of functions.
+--
+data LabelledFork =
+      ForkLabelledIO
+    | ForkLabelledOn
+    | ForkLabelledIOWithUnmask
+    | ForkLabelledFinally
+    | AsyncLabelled
+    | AsyncLabelledBound
+    | AsyncLabelledOn
+    | AsyncLabelledWithUnmask
+    | AsyncLabelledOnWithUnmask
+    | WithAsyncLabelled
+    | WithAsyncLabelledBound
+    | WithAsyncLabelledOn
+    | WithAsyncLabelledWithUnmask
+    | WithAsyncLabelledOnWithUnmask
+  deriving (Show, Eq, Enum, Bounded)
+
+-- | Functions which fork a bound thread, in `IO` they require the threaded
+-- RTS.
+--
+isBoundLabelledFork :: LabelledFork -> Bool
+isBoundLabelledFork AsyncLabelledBound     = True
+isBoundLabelledFork WithAsyncLabelledBound = True
+isBoundLabelledFork _                      = False
+
+-- | Run an action in a thread forked with the given function, and wait for
+-- its result.
+--
+runLabelledFork :: forall m a.
+                   ( MonadAsync m
+                   , MonadFork  m
+                   , MonadCatch m
+                   )
+                => LabelledFork
+                -> String
+                -- ^ label
+                -> m a
+                -> m (ThreadId m, a)
+runLabelledFork fork lbl child =
+    case fork of
+      ForkLabelledIO                -> viaTMVar $ \k ->
+                                         forkLabelledIO lbl (try child >>= k)
+      ForkLabelledOn                -> viaTMVar $ \k ->
+                                         forkLabelledOn lbl 0 (try child >>= k)
+      ForkLabelledIOWithUnmask      -> viaTMVar $ \k ->
+                                         forkLabelledIOWithUnmask lbl
+                                           (\unmask -> try (unmask child) >>= k)
+      ForkLabelledFinally           -> viaTMVar $
+                                         forkLabelledFinally lbl child
+      AsyncLabelled                 -> asyncLabelled lbl child >>= waitAsync
+      AsyncLabelledBound            -> asyncLabelledBound lbl child >>= waitAsync
+      AsyncLabelledOn               -> asyncLabelledOn lbl 0 child >>= waitAsync
+      AsyncLabelledWithUnmask       -> asyncLabelledWithUnmask lbl
+                                         (\unmask -> unmask child)
+                                       >>= waitAsync
+      AsyncLabelledOnWithUnmask     -> asyncLabelledOnWithUnmask lbl 0
+                                         (\unmask -> unmask child)
+                                       >>= waitAsync
+      WithAsyncLabelled             -> withAsyncLabelled lbl child waitAsync
+      WithAsyncLabelledBound        -> withAsyncLabelledBound lbl child waitAsync
+      WithAsyncLabelledOn           -> withAsyncLabelledOn lbl 0 child waitAsync
+      WithAsyncLabelledWithUnmask   -> withAsyncLabelledWithUnmask lbl
+                                         (\unmask -> unmask child)
+                                         waitAsync
+      WithAsyncLabelledOnWithUnmask -> withAsyncLabelledOnWithUnmask lbl 0
+                                         (\unmask -> unmask child)
+                                         waitAsync
+  where
+    viaTMVar :: ((Either SomeException a -> m ()) -> m (ThreadId m))
+             -> m (ThreadId m, a)
+    viaTMVar forkFn = do
+      var <- newEmptyTMVarIO
+      tid <- forkFn (atomically . putTMVar var)
+      r <- atomically (takeTMVar var)
+      either throwIO (return . (tid,)) r
+
+    waitAsync :: Async m a -> m (ThreadId m, a)
+    waitAsync a = (asyncThreadId a,) <$> wait a
+
+-- | Check that a thread forked with a labelled `fork` or `async` function is
+-- labelled before it runs.
+--
+prop_labelled_fork :: ( MonadAsync m
+                      , MonadFork  m
+                      , MonadCatch m
+                      )
+                   => LabelledFork -> m Property
+prop_labelled_fork fork = do
+    (_, lbl) <- runLabelledFork fork "label" (threadLabel =<< myThreadId)
+    return $ counterexample (show fork)
+           $ lbl === Just "label"
 
 --
 -- MonadMask properties

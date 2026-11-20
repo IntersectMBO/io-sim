@@ -47,6 +47,14 @@
   its target, e.g. by writing a `TVar` the target is blocked on.  This can
   multiply the number of explored schedules, e.g. when timeouts fire while
   their actions wait in STM transactions which other threads wake up.
+  * Added `explorationRacyByLabel` with two combinators
+    - `withRacyMainThread` - make all threads part of schedule exploration
+    - `withRacyByLabel` - select which threads are part of schedule exploration
+      based on thread labels.  For it one must use one of `forkLabelledIO`,
+      `asyncLabelled`, `withAsyncLabelled` or similar functions from `MonadFork`
+      and `MonadAsync` type classes.
+    - `controlSimTrace` now takes the `racyByLabel` callback, when replaying
+      a `ScheduleControl` you must use the same `racyByLabel`.
 
 ## 1.11.0.0
 

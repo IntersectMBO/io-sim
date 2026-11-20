@@ -53,6 +53,14 @@ class MonadThread m => MonadFork m where
 
   getNumCapabilities :: m Int
 
+  -- non-standard API
+  --
+  forkLabelledIO      :: String -> m () -> m (ThreadId m)
+  forkLabelledOn      :: String -> Int -> m () -> m (ThreadId m)
+  forkLabelledIOWithUnmask
+                      :: String -> ((forall a. m a -> m a) -> m ()) -> m (ThreadId m)
+  forkLabelledFinally :: String -> m a -> (Either SomeException a -> m ()) -> m (ThreadId m)
+
 
 instance MonadThread IO where
   type ThreadId IO = IO.ThreadId
@@ -74,6 +82,13 @@ instance MonadFork IO where
   yield              = IO.yield
   getNumCapabilities = IO.getNumCapabilities
 
+  forkLabelledIO lbl      = forkIO   . (labelThisThread lbl >>)
+  forkLabelledOn lbl c    = forkOn c . (labelThisThread lbl >>)
+  forkLabelledIOWithUnmask lbl k
+                          = forkIOWithUnmask (\unmask -> labelThisThread lbl >> k unmask)
+  forkLabelledFinally lbl = forkFinally . (labelThisThread lbl >>)
+
+
 instance MonadThread m => MonadThread (ReaderT r m) where
   type ThreadId (ReaderT r m) = ThreadId m
   myThreadId      = lift myThreadId
@@ -93,3 +108,12 @@ instance MonadFork m => MonadFork (ReaderT e m) where
   yield       = lift yield
 
   getNumCapabilities = lift getNumCapabilities
+
+  forkLabelledIO lbl (ReaderT f)   = ReaderT $ \e -> forkLabelledIO lbl (f e)
+  forkLabelledOn lbl n (ReaderT f) = ReaderT $ \e -> forkLabelledOn lbl n (f e)
+  forkLabelledIOWithUnmask lbl k   = ReaderT $ \e -> forkLabelledIOWithUnmask lbl $ \restore ->
+                                     let restore' :: ReaderT e m a -> ReaderT e m a
+                                         restore' (ReaderT f) = ReaderT $ restore . f
+                                     in runReaderT (k restore') e
+  forkLabelledFinally lbl f k      = ReaderT $ \e -> forkLabelledFinally lbl (runReaderT f e)
+                                                   $ \err -> runReaderT (k err) e

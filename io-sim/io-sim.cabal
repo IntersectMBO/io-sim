@@ -105,9 +105,10 @@ test-suite test
                        io-sim,
                        QuickCheck,
                        tasty,
-                       tasty-quickcheck,
                        tasty-hunit,
-                       time
+                       tasty-quickcheck,
+                       time,
+                       transformers
   ghc-options:         -fno-ignore-asserts
                        -rtsopts
   if impl(ghc >= 9.8)
