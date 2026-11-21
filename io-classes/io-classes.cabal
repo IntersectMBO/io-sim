@@ -79,6 +79,7 @@ library
                        Control.Monad.Class.MonadAsync
                        Control.Monad.Class.MonadEventlog
                        Control.Monad.Class.MonadFork
+                       Control.Monad.Class.MonadIORef
                        Control.Monad.Class.MonadSay
                        Control.Monad.Class.MonadST
                        Control.Monad.Class.MonadSTM
