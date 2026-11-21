@@ -255,16 +255,16 @@ instance Applicative (IOSim s) where
 
     {-# INLINE (<*>) #-}
     (<*>) = \df dx -> IOSim $ oneShot $ \k ->
-                        unIOSim df (\f -> unIOSim dx (\x -> k (f x)))
+                        unIOSim df (\f -> unIOSim dx (oneShot $ \x -> k (f x)))
 
     {-# INLINE (*>) #-}
-    (*>) = \dm dn -> IOSim $ oneShot $ \k -> unIOSim dm (\_ -> unIOSim dn k)
+    (*>) = \dm dn -> IOSim $ oneShot $ \k -> unIOSim dm (oneShot $ \_ -> unIOSim dn k)
 
 instance Monad (IOSim s) where
     return = pure
 
     {-# INLINE (>>=) #-}
-    (>>=) = \dm f -> IOSim $ oneShot $ \k -> unIOSim dm (\m -> unIOSim (f m) k)
+    (>>=) = \dm f -> IOSim $ oneShot $ \k -> unIOSim dm (oneShot $ \m -> unIOSim (f m) k)
 
     {-# INLINE (>>) #-}
     (>>) = (*>)
